@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    env_file: .env
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: blaze
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: blaze
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blaze"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  postgres_data:

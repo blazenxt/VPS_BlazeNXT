@@ -1,0 +1,9 @@
+.env
+*.db
+*.sqlite3
+__pycache__/
+.pytest_cache/
+.venv/
+artifacts/
+pending_approvals/
+*.log

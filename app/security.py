@@ -1,0 +1,33 @@
+import hashlib,hmac,io,re,secrets,time,zipfile
+from pathlib import PurePosixPath
+from itsdangerous import BadSignature,SignatureExpired,URLSafeTimedSerializer
+from app.config import get_settings
+s=get_settings(); signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-session-v1'); SAFE=re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$')
+def sign_session(uid): return signer.dumps({'uid':uid,'csrf':secrets.token_urlsafe(24)})
+def read_session(v):
+    try:return signer.loads(v,max_age=s.session_ttl_seconds)
+    except (BadSignature,SignatureExpired):return None
+def verify_telegram(data):
+    supplied=data.get('hash',''); clean={k:str(v) for k,v in data.items() if k!='hash' and v is not None}
+    try:
+        if abs(int(time.time())-int(clean.get('auth_date','0')))>300:return False
+    except ValueError:return False
+    check='\n'.join(f'{k}={clean[k]}' for k in sorted(clean)); key=hashlib.sha256(s.bot_token.encode()).digest()
+    return hmac.compare_digest(hmac.new(key,check.encode(),hashlib.sha256).hexdigest(),supplied)
+def hash_token(v):return hmac.new(s.app_secret.encode(),v.encode(),hashlib.sha256).hexdigest()
+def safe_filename(name):
+    if '/' in name or '\\' in name: raise ValueError('paths are not allowed')
+    if not SAFE.fullmatch(name) or name.startswith('.'):raise ValueError('unsafe filename')
+    return name
+def inspect_zip(data):
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        infos=z.infolist()
+        if len(infos)>300:raise ValueError('archive has too many files')
+        total=0
+        for i in infos:
+            p=PurePosixPath(i.filename.replace('\\','/'))
+            if p.is_absolute() or '..' in p.parts:raise ValueError('unsafe archive path')
+            if i.is_dir():continue
+            total+=i.file_size
+            if i.file_size>25*1024*1024 or total>50*1024*1024:raise ValueError('archive expands beyond limit')
+            if i.compress_size and i.file_size/i.compress_size>100:raise ValueError('suspicious compression ratio')
