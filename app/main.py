@@ -1,6 +1,6 @@
-import hashlib,io,logging,re,secrets,time,zipfile
+import asyncio,hashlib,io,json,logging,re,secrets,time,zipfile
 from contextlib import asynccontextmanager
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,19 +10,34 @@ from sqlalchemy import func,select
 from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Artifact,AuditLog,Role,RunnerToken,State,User,Workload
+from app.models import Artifact,AuditLog,Backup,Notification,Role,RunnerToken,Schedule,State,User,Workload,WorkloadMember,WorkloadVariable
 from app.railway import RailwayClient
-from app.security import hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
-from app.services import audit,provision,quota
+from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
+from app.services import audit,perform_action,provision,quota,refresh_artifact
 s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt')
 async def configure_telegram_webhook():
     import httpx
     webhook=f"{s.web_base_url.rstrip('/')}/telegram/webhook/{s.telegram_webhook_secret}"
     async with httpx.AsyncClient(timeout=15) as client:
-        response=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setWebhook',json={'url':webhook,'drop_pending_updates':False,'allowed_updates':['message']})
-    response.raise_for_status();result=response.json()
-    if not result.get('ok'):raise RuntimeError(result.get('description','Telegram rejected webhook'))
-    logger.info('Telegram webhook configured for %s',s.web_base_url)
+        response=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setWebhook',json={'url':webhook,'drop_pending_updates':False,'allowed_updates':['message','callback_query']})
+        response.raise_for_status();result=response.json()
+        if not result.get('ok'):raise RuntimeError(result.get('description','Telegram rejected webhook'))
+        commands=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setMyCommands',json={'commands':[{'command':'start','description':'Open BlazeNXT control center'},{'command':'servers','description':'List and control workloads'},{'command':'deploy','description':'Upload and deploy code'},{'command':'help','description':'Show deployment help'}]})
+        commands.raise_for_status()
+    logger.info('Telegram webhook and commands configured for %s',s.web_base_url)
+async def schedule_worker():
+    while True:
+        await asyncio.sleep(30)
+        try:
+            with SessionLocal() as db:
+                now=datetime.now(timezone.utc);rows=db.scalars(select(Schedule).where(Schedule.enabled==True,Schedule.next_run<=now)).all()
+                for row in rows:
+                    w=db.get(Workload,row.workload_id)
+                    try:
+                        if w and w.state!=State.deleted:await perform_action(db,w,row.action);audit(db,None,f'schedule.{row.action}',f'workload:{row.workload_id}','scheduler',{'schedule_id':row.id})
+                    except Exception as e:audit(db,None,'schedule.failed',f'workload:{row.workload_id}','scheduler',{'error':str(e)[:300]})
+                    row.last_run=now;row.next_run=now+timedelta(minutes=row.interval_minutes);db.commit()
+        except Exception:logger.exception('Schedule worker failed')
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
@@ -30,8 +45,10 @@ async def lifespan(app):
     if s.bot_token and s.web_base_url.startswith('https://') and s.telegram_webhook_secret!='change-me':
         try:await configure_telegram_webhook()
         except Exception:logger.exception('Automatic Telegram webhook configuration failed')
+    scheduler=asyncio.create_task(schedule_worker())
     yield
-app=FastAPI(title='BlazeNXT Hosting',version='2.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
+    scheduler.cancel()
+app=FastAPI(title='BlazeNXT Control Plane',version='3.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.middleware('http')
 async def security_headers(request,call_next):
@@ -66,7 +83,10 @@ def logout(request:Request,u=Depends(current),_=Depends(csrf)):
     r=RedirectResponse('/',303);r.delete_cookie('blaze_session');return r
 @app.get('/dashboard',response_class=HTMLResponse)
 def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
-    ws=db.scalars(select(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all();return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,quota=quota(u)))
+    shared_ids=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all()
+    ws=db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared_ids)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
+    notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
+    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,quota=quota(u),notifications=notes))
 @app.post('/workloads')
 async def upload(request:Request,bg:BackgroundTasks,name:str=Form(...),runtime:str=Form(...),entrypoint:str=Form(...),file:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     active=db.scalar(select(func.count()).select_from(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)) or 0
@@ -87,29 +107,27 @@ async def run_provision(wid):
         if w:await provision(db,w)
 @app.post('/workloads/{wid}/{action}')
 async def action(wid:int,action:str,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
-    w=db.get(Workload,wid)
-    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise HTTPException(404)
-    c=RailwayClient()
-    try:
-        if action in {'start','restart'}:await c.redeploy(w.railway_service_id);w.state=State.running
-        elif action=='stop':
-            ds=await c.deployments(w.railway_service_id)
-            if ds:await c.stop(ds[0]['id'])
-            w.state=State.stopped
-        elif action=='delete':await c.delete(w.railway_service_id);w.state=State.deleted
-        else:raise HTTPException(400,'Unknown action')
-        audit(db,u,f'workload.{action}',f'workload:{wid}',request.client.host if request.client else '');db.commit()
-    except HTTPException:raise
+    w=accessible_workload(wid,u,db,'control')
+    if action=='delete' and w.user_id!=u.id and u.role not in {Role.admin,Role.owner}:raise HTTPException(403,'Only the owner can delete')
+    try:await perform_action(db,w,action);audit(db,u,f'workload.{action}',f'workload:{wid}',request.client.host if request.client else '');db.commit()
     except Exception as e:w.last_error=str(e)[:1000];db.commit();raise HTTPException(502,str(e))
     return RedirectResponse(f'/servers/{wid}',303)
 @app.get('/api/workloads/{wid}/logs')
 async def logs(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
-    w=db.get(Workload,wid)
-    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise HTTPException(404)
+    w=accessible_workload(wid,u,db,'logs')
+    if not w.railway_service_id:return {'logs':[]}
     ds=await RailwayClient().deployments(w.railway_service_id);return {'logs':await RailwayClient().logs(ds[0]['id']) if ds else []}
-def owned_workload(wid:int,u:User,db:Session):
+def accessible_workload(wid:int,u:User,db:Session,permission='view'):
     w=db.get(Workload,wid)
-    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise HTTPException(404)
+    if not w:raise HTTPException(404)
+    if w.user_id==u.id or u.role in {Role.admin,Role.owner}:return w
+    member=db.scalar(select(WorkloadMember).where(WorkloadMember.workload_id==wid,WorkloadMember.user_id==u.id))
+    allowed=json.loads(member.permissions) if member else []
+    if not member or permission not in allowed:raise HTTPException(404)
+    return w
+def owned_workload(wid:int,u:User,db:Session):
+    w=accessible_workload(wid,u,db)
+    if w.user_id!=u.id and u.role not in {Role.admin,Role.owner}:raise HTTPException(403,'Owner access required')
     return w
 
 def artifact_files(a:Artifact):
@@ -121,12 +139,17 @@ def artifact_files(a:Artifact):
 
 @app.get('/servers/{wid}',response_class=HTMLResponse)
 async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends(current),db:Session=Depends(get_db)):
-    w=owned_workload(wid,u,db);deployments=[];provider_error=None
+    w=accessible_workload(wid,u,db);deployments=[];provider_error=None
     if w.railway_service_id:
         try:deployments=await RailwayClient().deployments(w.railway_service_id)
         except Exception as e:provider_error=str(e)
     events=db.scalars(select(AuditLog).where(AuditLog.target==f'workload:{wid}').order_by(AuditLog.created_at.desc()).limit(100)).all()
-    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events))
+    variables=db.scalars(select(WorkloadVariable).where(WorkloadVariable.workload_id==wid).order_by(WorkloadVariable.name)).all()
+    backups=db.scalars(select(Backup).where(Backup.workload_id==wid).order_by(Backup.created_at.desc())).all()
+    members=db.scalars(select(WorkloadMember).where(WorkloadMember.workload_id==wid)).all()
+    schedules=db.scalars(select(Schedule).where(Schedule.workload_id==wid).order_by(Schedule.created_at.desc())).all()
+    is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
+    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner))
 
 @app.get('/servers/{wid}/download')
 def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
@@ -135,11 +158,86 @@ def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)
 
 @app.get('/api/workloads/{wid}/status')
 async def workload_status(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
-    w=owned_workload(wid,u,db);deployments=[]
+    w=accessible_workload(wid,u,db);deployments=[]
     if w.railway_service_id:
         try:deployments=await RailwayClient().deployments(w.railway_service_id)
         except Exception as e:return {'state':w.state.value,'provider_error':str(e),'deployments':[]}
     return {'state':w.state.value,'service_id':w.railway_service_id,'deployments':deployments}
+
+@app.post('/servers/{wid}/replace')
+async def replace_artifact(wid:int,request:Request,file:UploadFile=File(...),entrypoint:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    try:filename=safe_filename(file.filename or 'upload');entrypoint=safe_filename(entrypoint)
+    except ValueError as e:raise HTTPException(400,str(e))
+    data=await file.read(s.max_upload_mb*1024*1024+1)
+    if len(data)>s.max_upload_mb*1024*1024:raise HTTPException(413,'Upload too large')
+    if filename.endswith('.zip'):inspect_zip(data)
+    elif not ((w.runtime=='python' and filename.endswith('.py')) or (w.runtime=='node' and filename.endswith('.js'))):raise HTTPException(400,'File does not match runtime')
+    old=w.artifact;db.add(Backup(workload_id=wid,name='Automatic pre-deploy backup',filename=old.filename,sha256=old.sha256,size=old.size,data=old.data))
+    a=Artifact(owner_id=w.user_id,filename=filename,content_type=file.content_type or 'application/octet-stream',sha256=hashlib.sha256(data).hexdigest(),size=len(data),data=data);db.add(a);db.flush();w.artifact_id=a.id;w.entrypoint=entrypoint;audit(db,u,'artifact.replace',f'workload:{wid}',request.client.host if request.client else '',{'sha256':a.sha256});db.commit()
+    if w.railway_service_id:await refresh_artifact(db,w)
+    return RedirectResponse(f'/servers/{wid}?tab=files',303)
+
+@app.post('/servers/{wid}/variables')
+async def add_variable(wid:int,request:Request,name:str=Form(...),value:str=Form(...),secret:bool=Form(False),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);name=name.strip().upper();reserved={'CONTROL_PLANE_URL','RUNNER_TOKEN','WORKLOAD_ID','ENTRYPOINT','RUNTIME'}
+    if not re.fullmatch(r'[A-Z_][A-Z0-9_]{0,79}',name) or name in reserved:raise HTTPException(400,'Invalid or reserved variable name')
+    row=db.scalar(select(WorkloadVariable).where(WorkloadVariable.workload_id==wid,WorkloadVariable.name==name))
+    if row:row.encrypted_value=encrypt_secret(value);row.is_secret=secret
+    else:db.add(WorkloadVariable(workload_id=wid,name=name,encrypted_value=encrypt_secret(value),is_secret=secret))
+    audit(db,u,'variable.upsert',f'workload:{wid}',request.client.host if request.client else '',{'name':name});db.commit()
+    if w.railway_service_id:
+        await RailwayClient().upsert_variables(w.railway_service_id,{name:value});await RailwayClient().redeploy(w.railway_service_id)
+    return RedirectResponse(f'/servers/{wid}?tab=variables',303)
+
+@app.post('/servers/{wid}/variables/{vid}/delete')
+async def delete_variable(wid:int,vid:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);row=db.get(WorkloadVariable,vid)
+    if not row or row.workload_id!=wid:raise HTTPException(404)
+    name=row.name;audit(db,u,'variable.delete',f'workload:{wid}',request.client.host if request.client else '',{'name':name});db.delete(row);db.commit()
+    if w.railway_service_id:await RailwayClient().upsert_variables(w.railway_service_id,{name:''});await RailwayClient().redeploy(w.railway_service_id)
+    return RedirectResponse(f'/servers/{wid}?tab=variables',303)
+
+@app.post('/servers/{wid}/backups')
+def create_backup(wid:int,request:Request,name:str=Form('Manual backup'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);a=w.artifact;b=Backup(workload_id=wid,name=name[:100] or 'Manual backup',filename=a.filename,sha256=a.sha256,size=a.size,data=a.data);db.add(b);audit(db,u,'backup.create',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+@app.get('/servers/{wid}/backups/{bid}')
+def download_backup(wid:int,bid:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    accessible_workload(wid,u,db,'files');b=db.get(Backup,bid)
+    if not b or b.workload_id!=wid:raise HTTPException(404)
+    name=re.sub(r'[^A-Za-z0-9_.-]','_',b.filename);return Response(b.data,media_type='application/octet-stream',headers={'Content-Disposition':f'attachment; filename="{name}"'})
+@app.post('/servers/{wid}/backups/{bid}/delete')
+def delete_backup(wid:int,bid:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db);b=db.get(Backup,bid)
+    if not b or b.workload_id!=wid:raise HTTPException(404)
+    db.delete(b);audit(db,u,'backup.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+
+@app.post('/servers/{wid}/members')
+def add_member(wid:int,request:Request,telegram_id:int=Form(...),permissions:str=Form('view,logs'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);target=db.scalar(select(User).where(User.telegram_id==telegram_id))
+    if not target:raise HTTPException(400,'User must sign in to BlazeNXT first')
+    if target.id==w.user_id:raise HTTPException(400,'Owner already has full access')
+    allowed={'view','logs','control','files'};perms=[x for x in permissions.split(',') if x in allowed]
+    row=db.scalar(select(WorkloadMember).where(WorkloadMember.workload_id==wid,WorkloadMember.user_id==target.id))
+    if row:row.permissions=json.dumps(perms)
+    else:db.add(WorkloadMember(workload_id=wid,user_id=target.id,permissions=json.dumps(perms)))
+    audit(db,u,'member.upsert',f'workload:{wid}',request.client.host if request.client else '',{'user_id':target.id,'permissions':perms});db.commit();return RedirectResponse(f'/servers/{wid}?tab=members',303)
+@app.post('/servers/{wid}/members/{mid}/delete')
+def delete_member(wid:int,mid:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db);m=db.get(WorkloadMember,mid)
+    if not m or m.workload_id!=wid:raise HTTPException(404)
+    db.delete(m);audit(db,u,'member.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=members',303)
+
+@app.post('/servers/{wid}/schedules')
+def add_schedule(wid:int,request:Request,name:str=Form(...),action_name:str=Form(...),interval_minutes:int=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db)
+    if action_name not in {'start','stop','restart'} or not 5<=interval_minutes<=43200:raise HTTPException(400,'Invalid schedule')
+    db.add(Schedule(workload_id=wid,name=name[:100],action=action_name,interval_minutes=interval_minutes,next_run=datetime.now(timezone.utc)+timedelta(minutes=interval_minutes)));audit(db,u,'schedule.create',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=schedules',303)
+@app.post('/servers/{wid}/schedules/{sid}/delete')
+def delete_schedule(wid:int,sid:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db);row=db.get(Schedule,sid)
+    if not row or row.workload_id!=wid:raise HTTPException(404)
+    db.delete(row);audit(db,u,'schedule.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=schedules',303)
 
 @app.get('/internal/artifacts/{wid}')
 def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
@@ -149,11 +247,8 @@ def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
 @app.post('/telegram/webhook/{secret}')
 async def telegram(secret:str,request:Request):
     if not secrets.compare_digest(secret,s.telegram_webhook_secret):raise HTTPException(404)
-    update=await request.json();message=update.get('message',{});chat=message.get('chat',{});text=message.get('text','')
-    if chat and text.startswith('/start') and s.bot_token:
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as c:await c.post(f'https://api.telegram.org/bot{s.bot_token}/sendMessage',json={'chat_id':chat['id'],'text':'Welcome to BlazeNXT secure hosting.','reply_markup':{'inline_keyboard':[[{'text':'Open Dashboard','url':s.web_base_url}]]}})
-    return {'ok':True}
+    from app.telegram_bot import handle_update
+    await handle_update(await request.json());return {'ok':True}
 @app.get('/admin',response_class=HTMLResponse)
 def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)

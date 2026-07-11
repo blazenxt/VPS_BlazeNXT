@@ -14,8 +14,10 @@ class RailwayClient:
     async def create(self,name,variables):
         q='mutation($input:ServiceCreateInput!){serviceCreate(input:$input){id name}}'
         d=await self.gql(q,{'input':{'projectId':self.s.railway_project_id,'name':name,'source':{'image':self.s.railway_runner_image}}}); sid=d['serviceCreate']['id']
+        await self.upsert_variables(sid,variables);return sid
+    async def upsert_variables(self,sid,variables):
         q='mutation($input:VariableCollectionUpsertInput!){variableCollectionUpsert(input:$input)}'
-        await self.gql(q,{'input':{'projectId':self.s.railway_project_id,'environmentId':self.s.railway_environment_id,'serviceId':sid,'variables':variables}});return sid
+        return await self.gql(q,{'input':{'projectId':self.s.railway_project_id,'environmentId':self.s.railway_environment_id,'serviceId':sid,'variables':variables}})
     async def redeploy(self,sid):
         return await self.gql('mutation($s:String!,$e:String!){serviceInstanceRedeploy(serviceId:$s,environmentId:$e)}',{'s':sid,'e':self.s.railway_environment_id})
     async def delete(self,sid):return await self.gql('mutation($id:String!){serviceDelete(id:$id)}',{'id':sid})

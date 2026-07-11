@@ -1,4 +1,4 @@
-# BlazeNXT Hosting Platform v2
+# BlazeNXT Control Plane v3
 
 Railway-native Telegram bot hosting with a FastAPI website/control plane. Uploaded code is never executed by the website: each workload is provisioned as a separate Railway service using a non-root runner image.
 
@@ -7,9 +7,14 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Telegram Login verification, signed HttpOnly sessions, CSRF and rate limiting
 - Python, Node and ZIP uploads with size, zip-slip, zip-bomb and SHA-256 checks
 - Workload-scoped expiring artifact tokens, removed from the child process environment
-- Pterodactyl-inspired responsive control panel with server list, detail tabs and status cards
-- Separate Railway service per workload; start, stop, restart, delete and auto-refreshing logs
-- Read-only artifact file explorer, secure package download, startup/isolation view and per-server activity timeline
+- Original Pterodactyl + Railway + KataBump-inspired responsive control plane
+- One synchronized identity and workload state across Telegram bot and website
+- Telegram file uploads, server lists, status cards and start/stop/restart controls
+- Separate Railway service per workload with auto-refreshing runtime logs
+- Artifact file explorer, secure downloads, package replacement and automatic pre-deploy backup
+- Encrypted environment variables synchronized to Railway and masked in the panel
+- Manual artifact backups, lifecycle schedules and permission-based server collaborators
+- Startup/isolation details, notifications and unified web/bot/scheduler activity timeline
 - User/premium/admin/owner roles, quotas and upgraded admin controls
 - Audit trail, health/readiness endpoints and Prometheus metrics
 - Docker Compose for local use, Railway config and GHCR runner workflow

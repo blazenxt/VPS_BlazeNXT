@@ -1,5 +1,6 @@
-import hashlib,hmac,io,re,secrets,time,zipfile
+import base64,hashlib,hmac,io,re,secrets,time,zipfile
 from pathlib import PurePosixPath
+from cryptography.fernet import Fernet, InvalidToken
 from itsdangerous import BadSignature,SignatureExpired,URLSafeTimedSerializer
 from app.config import get_settings
 s=get_settings(); signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-session-v1'); SAFE=re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$')
@@ -15,6 +16,11 @@ def verify_telegram(data):
     check='\n'.join(f'{k}={clean[k]}' for k in sorted(clean)); key=hashlib.sha256(s.bot_token.encode()).digest()
     return hmac.compare_digest(hmac.new(key,check.encode(),hashlib.sha256).hexdigest(),supplied)
 def hash_token(v):return hmac.new(s.app_secret.encode(),v.encode(),hashlib.sha256).hexdigest()
+def _fernet():return Fernet(base64.urlsafe_b64encode(hashlib.sha256(s.app_secret.encode()).digest()))
+def encrypt_secret(value):return _fernet().encrypt(value.encode()).decode()
+def decrypt_secret(value):
+    try:return _fernet().decrypt(value.encode()).decode()
+    except InvalidToken:raise ValueError('Unable to decrypt stored secret')
 def safe_filename(name):
     if '/' in name or '\\' in name: raise ValueError('paths are not allowed')
     if not SAFE.fullmatch(name) or name.startswith('.'):raise ValueError('unsafe filename')

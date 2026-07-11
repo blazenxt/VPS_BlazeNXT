@@ -1,6 +1,6 @@
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, LargeBinary, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
@@ -43,3 +43,27 @@ class AuditLog(Base):
     id:Mapped[int]=mapped_column(primary_key=True); actor_id:Mapped[int|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),index=True)
     action:Mapped[str]=mapped_column(String(80),index=True); target:Mapped[str]=mapped_column(String(160)); ip:Mapped[str]=mapped_column(String(64)); detail:Mapped[str]=mapped_column(Text,default='{}')
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class WorkloadVariable(Base):
+    __tablename__='workload_variables'; __table_args__=(UniqueConstraint('workload_id','name'),)
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True)
+    name:Mapped[str]=mapped_column(String(80)); encrypted_value:Mapped[str]=mapped_column(Text); is_secret:Mapped[bool]=mapped_column(Boolean,default=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+class Backup(Base):
+    __tablename__='backups'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True)
+    name:Mapped[str]=mapped_column(String(100)); filename:Mapped[str]=mapped_column(String(160)); sha256:Mapped[str]=mapped_column(String(64)); size:Mapped[int]=mapped_column(Integer); data:Mapped[bytes]=mapped_column(LargeBinary)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class WorkloadMember(Base):
+    __tablename__='workload_members'; __table_args__=(UniqueConstraint('workload_id','user_id'),)
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
+    permissions:Mapped[str]=mapped_column(Text,default='["view","logs"]'); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+    user:Mapped[User]=relationship()
+class Schedule(Base):
+    __tablename__='schedules'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True)
+    name:Mapped[str]=mapped_column(String(100)); action:Mapped[str]=mapped_column(String(20)); interval_minutes:Mapped[int]=mapped_column(Integer); enabled:Mapped[bool]=mapped_column(Boolean,default=True)
+    next_run:Mapped[datetime]=mapped_column(DateTime(timezone=True)); last_run:Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class Notification(Base):
+    __tablename__='notifications'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
+    title:Mapped[str]=mapped_column(String(120)); message:Mapped[str]=mapped_column(Text); read:Mapped[bool]=mapped_column(Boolean,default=False); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
