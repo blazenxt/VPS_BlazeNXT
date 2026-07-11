@@ -1,4 +1,4 @@
-import hashlib,re,secrets,time
+import hashlib,logging,re,secrets,time
 from contextlib import asynccontextmanager
 from datetime import datetime,timezone
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
@@ -14,11 +14,22 @@ from app.models import Artifact,AuditLog,Role,RunnerToken,State,User,Workload
 from app.railway import RailwayClient
 from app.security import hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
 from app.services import audit,provision,quota
-s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={}
+s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt')
+async def configure_telegram_webhook():
+    import httpx
+    webhook=f"{s.web_base_url.rstrip('/')}/telegram/webhook/{s.telegram_webhook_secret}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        response=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setWebhook',json={'url':webhook,'drop_pending_updates':False,'allowed_updates':['message']})
+    response.raise_for_status();result=response.json()
+    if not result.get('ok'):raise RuntimeError(result.get('description','Telegram rejected webhook'))
+    logger.info('Telegram webhook configured for %s',s.web_base_url)
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
     if s.production and ('change-me' in s.app_secret or not s.bot_token):raise RuntimeError('Production secrets are not configured')
+    if s.bot_token and s.web_base_url.startswith('https://') and s.telegram_webhook_secret!='change-me':
+        try:await configure_telegram_webhook()
+        except Exception:logger.exception('Automatic Telegram webhook configuration failed')
     yield
 app=FastAPI(title='BlazeNXT Hosting',version='2.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
 app.mount('/static',StaticFiles(directory='static'),name='static')

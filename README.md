@@ -26,9 +26,8 @@ Railway does not support safe Docker-in-Docker in a normal app service. Isolatio
 5. Let GitHub Actions publish `ghcr.io/blazenxt/vps-blazenxt-runner:latest`; make the package public or configure registry credentials in Railway.
 6. Add `hosting.blazenxt.in` as a Railway custom domain and follow Railway's DNS instructions.
 7. In BotFather use `/setdomain` with `hosting.blazenxt.in`.
-8. Register the webhook:
-   `https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://hosting.blazenxt.in/telegram/webhook/<TELEGRAM_WEBHOOK_SECRET>`
-9. Confirm `/health/ready` returns ready before enabling users.
+8. Deploy or restart the service. On startup, the control plane securely registers its Telegram webhook from `WEB_BASE_URL` and `TELEGRAM_WEBHOOK_SECRET`; no manual curl command is needed.
+9. Confirm `/health/ready` returns ready and check the deployment log for `Telegram webhook configured` before enabling users.
 
 Without Railway variables, the dashboard works but deployments safely enter `failed` with a provider-not-configured error.
 
