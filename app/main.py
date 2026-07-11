@@ -99,8 +99,8 @@ async def logs(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
 @app.get('/internal/artifacts/{wid}')
 def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
     token=request.headers.get('Authorization','').removeprefix('Bearer ');rt=db.scalar(select(RunnerToken).where(RunnerToken.workload_id==wid,RunnerToken.token_hash==hash_token(token))) if token else None;now=datetime.now(timezone.utc)
-    if not rt or rt.consumed_at or rt.expires_at<now:raise HTTPException(401,'Invalid runner token')
-    w=db.get(Workload,wid);rt.consumed_at=now;db.commit();return Response(w.artifact.data,media_type=w.artifact.content_type,headers={'X-Filename':w.artifact.filename,'X-Content-SHA256':w.artifact.sha256,'Cache-Control':'no-store'})
+    if not rt or rt.expires_at<now:raise HTTPException(401,'Invalid runner token')
+    w=db.get(Workload,wid);return Response(w.artifact.data,media_type=w.artifact.content_type,headers={'X-Filename':w.artifact.filename,'X-Content-SHA256':w.artifact.sha256,'Cache-Control':'no-store'})
 @app.post('/telegram/webhook/{secret}')
 async def telegram(secret:str,request:Request):
     if not secrets.compare_digest(secret,s.telegram_webhook_secret):raise HTTPException(404)

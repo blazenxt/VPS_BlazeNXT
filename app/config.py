@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     railway_environment_id: str = ''
     railway_runner_image: str = 'ghcr.io/blazenxt/vps-blazenxt-runner:latest'
     railway_api_url: str = 'https://backboard.railway.com/graphql/v2'
-    runner_token_ttl_seconds: int = Field(900, ge=60, le=3600)
+    runner_token_ttl_seconds: int = Field(2592000, ge=3600, le=31536000)
     @field_validator('app_secret')
     @classmethod
     def validate_secret(cls, value):
