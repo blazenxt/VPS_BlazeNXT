@@ -7,8 +7,10 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Telegram Login verification, signed HttpOnly sessions, CSRF and rate limiting
 - Python, Node and ZIP uploads with size, zip-slip, zip-bomb and SHA-256 checks
 - Workload-scoped expiring artifact tokens, removed from the child process environment
-- Separate Railway service per workload; start, stop, restart, delete and logs
-- User/premium/admin/owner roles, quotas and admin controls
+- Pterodactyl-inspired responsive control panel with server list, detail tabs and status cards
+- Separate Railway service per workload; start, stop, restart, delete and auto-refreshing logs
+- Read-only artifact file explorer, secure package download, startup/isolation view and per-server activity timeline
+- User/premium/admin/owner roles, quotas and upgraded admin controls
 - Audit trail, health/readiness endpoints and Prometheus metrics
 - Docker Compose for local use, Railway config and GHCR runner workflow
 - Manual premium plans initially; billing can be added later

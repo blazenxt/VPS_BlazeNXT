@@ -1,4 +1,4 @@
-import hashlib,logging,re,secrets,time
+import hashlib,io,logging,re,secrets,time,zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timezone
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
@@ -101,12 +101,46 @@ async def action(wid:int,action:str,request:Request,u:User=Depends(current),_=De
         audit(db,u,f'workload.{action}',f'workload:{wid}',request.client.host if request.client else '');db.commit()
     except HTTPException:raise
     except Exception as e:w.last_error=str(e)[:1000];db.commit();raise HTTPException(502,str(e))
-    return RedirectResponse('/dashboard',303)
+    return RedirectResponse(f'/servers/{wid}',303)
 @app.get('/api/workloads/{wid}/logs')
 async def logs(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
     w=db.get(Workload,wid)
     if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise HTTPException(404)
     ds=await RailwayClient().deployments(w.railway_service_id);return {'logs':await RailwayClient().logs(ds[0]['id']) if ds else []}
+def owned_workload(wid:int,u:User,db:Session):
+    w=db.get(Workload,wid)
+    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise HTTPException(404)
+    return w
+
+def artifact_files(a:Artifact):
+    if not a.filename.endswith('.zip'):return [{'name':a.filename,'size':a.size,'kind':'file'}]
+    try:
+        with zipfile.ZipFile(io.BytesIO(a.data)) as z:
+            return [{'name':x.filename,'size':x.file_size,'kind':'folder' if x.is_dir() else 'file'} for x in z.infolist()[:300]]
+    except zipfile.BadZipFile:return []
+
+@app.get('/servers/{wid}',response_class=HTMLResponse)
+async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends(current),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);deployments=[];provider_error=None
+    if w.railway_service_id:
+        try:deployments=await RailwayClient().deployments(w.railway_service_id)
+        except Exception as e:provider_error=str(e)
+    events=db.scalars(select(AuditLog).where(AuditLog.target==f'workload:{wid}').order_by(AuditLog.created_at.desc()).limit(100)).all()
+    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events))
+
+@app.get('/servers/{wid}/download')
+def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);name=re.sub(r'[^A-Za-z0-9_.-]','_',w.artifact.filename)
+    return Response(w.artifact.data,media_type=w.artifact.content_type,headers={'Content-Disposition':f'attachment; filename="{name}"','X-Content-Type-Options':'nosniff'})
+
+@app.get('/api/workloads/{wid}/status')
+async def workload_status(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);deployments=[]
+    if w.railway_service_id:
+        try:deployments=await RailwayClient().deployments(w.railway_service_id)
+        except Exception as e:return {'state':w.state.value,'provider_error':str(e),'deployments':[]}
+    return {'state':w.state.value,'service_id':w.railway_service_id,'deployments':deployments}
+
 @app.get('/internal/artifacts/{wid}')
 def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
     token=request.headers.get('Authorization','').removeprefix('Bearer ');rt=db.scalar(select(RunnerToken).where(RunnerToken.workload_id==wid,RunnerToken.token_hash==hash_token(token))) if token else None;now=datetime.now(timezone.utc)
