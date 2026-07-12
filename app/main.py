@@ -14,7 +14,7 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import ApiKey,Artifact,AuditLog,AuthIdentity,Backup,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,WebhookDelivery,Workload,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import ApiKey,Artifact,AuditLog,AuthIdentity,Backup,ManagedDatabase,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,WebhookDelivery,Workload,WorkloadAllocation,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
@@ -100,8 +100,8 @@ def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)
     shared_ids=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all()
     ws=db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared_ids)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
     notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
-    global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
-    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS))
+    global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;visible_ids=[w.id for w in ws];allocations=db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(visible_ids))).all() if visible_ids else [];container_count=sum(x.replicas for x in allocations)+(len(ws)-len(allocations))
+    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,container_count=container_count,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS))
 @app.post('/workloads')
 async def upload(request:Request,bg:BackgroundTasks,name:str=Form(...),runtime:str=Form(...),entrypoint:str=Form(...),preset:str=Form('custom'),file:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     active=db.scalar(select(func.count()).select_from(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)) or 0
@@ -210,9 +210,9 @@ async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends
     backups=db.scalars(select(Backup).where(Backup.workload_id==wid).order_by(Backup.created_at.desc())).all()
     members=db.scalars(select(WorkloadMember).where(WorkloadMember.workload_id==wid)).all()
     schedules=db.scalars(select(Schedule).where(Schedule.workload_id==wid).order_by(Schedule.created_at.desc())).all()
-    webhooks=db.scalars(select(WorkloadWebhook).where(WorkloadWebhook.workload_id==wid).order_by(WorkloadWebhook.created_at.desc())).all();hook_ids=[x.id for x in webhooks];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hook_ids)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hook_ids else []
+    allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid));databases=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id==wid).order_by(ManagedDatabase.created_at.desc())).all();webhooks=db.scalars(select(WorkloadWebhook).where(WorkloadWebhook.workload_id==wid).order_by(WorkloadWebhook.created_at.desc())).all();hook_ids=[x.id for x in webhooks];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hook_ids)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hook_ids else []
     is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
-    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning))
+    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning,allocation=allocation,databases=databases,active_database_count=sum(1 for d in databases if d.state=='active'),max_databases=s.max_databases_per_workload))
 
 @app.get('/servers/{wid}/download')
 def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
@@ -344,6 +344,51 @@ def delete_schedule(wid:int,sid:int,request:Request,u:User=Depends(current),_=De
     owned_workload(wid,u,db);row=db.get(Schedule,sid)
     if not row or row.workload_id!=wid:raise HTTPException(404)
     db.delete(row);audit(db,u,'schedule.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=schedules',303)
+
+@app.post('/servers/{wid}/resources')
+async def update_resources(wid:int,request:Request,cpu_vcpus:float=Form(...),memory_mb:int=Form(...),replicas:int=Form(...),restart_policy:str=Form(...),restart_retries:int=Form(5),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    if not 0.1<=cpu_vcpus<=32 or not 128<=memory_mb<=131072 or not 1<=replicas<=20 or restart_policy not in {'ON_FAILURE','ALWAYS','NEVER'} or not 0<=restart_retries<=100:raise HTTPException(400,'Invalid resource allocation')
+    if not w.railway_service_id:raise HTTPException(400,'Service is not provisioned')
+    client=RailwayClient();await client.update_limits(w.railway_service_id,cpu_vcpus,memory_mb);await client.update_instance(w.railway_service_id,replicas,restart_policy,restart_retries);row=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid))
+    if not row:row=WorkloadAllocation(workload_id=wid);db.add(row)
+    row.cpu_vcpus=str(cpu_vcpus);row.memory_mb=memory_mb;row.replicas=replicas;row.restart_policy=restart_policy;row.restart_retries=restart_retries;audit(db,u,'resources.update',f'workload:{wid}',request.client.host if request.client else '',{'cpu':cpu_vcpus,'memory_mb':memory_mb,'replicas':replicas});db.commit();await dispatch_event(wid,'resources.updated',{'cpu':cpu_vcpus,'memory_mb':memory_mb,'replicas':replicas});return RedirectResponse(f'/servers/{wid}?tab=resources',303)
+@app.post('/servers/{wid}/suspension/{mode}')
+async def suspension(wid:int,mode:str,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    if mode not in {'suspend','unsuspend'}:raise HTTPException(400)
+    row=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid))
+    if not row:row=WorkloadAllocation(workload_id=wid,cpu_vcpus=str(s.default_cpu_vcpus),memory_mb=s.default_memory_mb);db.add(row)
+    if mode=='suspend':
+        deployments=await RailwayClient().deployments(w.railway_service_id)
+        if deployments:await RailwayClient().stop(deployments[0]['id'])
+        row.suspended=True;w.state=State.stopped
+    else:row.suspended=False;await RailwayClient().redeploy(w.railway_service_id);w.state=State.running
+    audit(db,u,f'workload.{mode}',f'workload:{wid}',request.client.host if request.client else '');db.commit();await dispatch_event(wid,f'workload.{mode}',{});return RedirectResponse(f'/servers/{wid}?tab=settings',303)
+@app.post('/servers/{wid}/databases')
+async def create_database(wid:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    if not s.enable_database_provisioning:raise HTTPException(403,'Database provisioning is disabled')
+    all_records=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id==wid)).all();existing=[x for x in all_records if x.state=='active']
+    if len(existing)>=s.max_databases_per_workload:raise HTTPException(403,'Database limit reached')
+    index=len(all_records)+1;service_name=f'blaze-db-{w.user_id}-{wid}-{index}';database_name=f'blaze_{wid}_{index}';username=f'blaze_{wid}';password=secrets.token_urlsafe(32);client=RailwayClient();sid=None
+    try:
+        sid=await client.create_image_service(service_name,'postgres:17-alpine',{'POSTGRES_DB':database_name,'POSTGRES_USER':username,'POSTGRES_PASSWORD':password,'PGDATA':'/var/lib/postgresql/data/pgdata'});volume_id=await client.create_volume(sid,'/var/lib/postgresql/data');host=f'{service_name}.railway.internal';url=f'postgresql://{username}:{password}@{host}:5432/{database_name}';row=ManagedDatabase(workload_id=wid,railway_service_id=sid,railway_volume_id=volume_id,service_name=service_name,database_name=database_name,username=username,encrypted_password=encrypt_secret(password),state='active');db.add(row);variable=db.scalar(select(WorkloadVariable).where(WorkloadVariable.workload_id==wid,WorkloadVariable.name=='DATABASE_URL'))
+        if variable:variable.encrypted_value=encrypt_secret(url);variable.is_secret=True
+        else:db.add(WorkloadVariable(workload_id=wid,name='DATABASE_URL',encrypted_value=encrypt_secret(url),is_secret=True))
+        db.commit();await client.upsert_variables(w.railway_service_id,{'DATABASE_URL':url});await client.redeploy(w.railway_service_id);audit(db,u,'database.create',f'workload:{wid}',request.client.host if request.client else '',{'service_id':sid});db.commit();await dispatch_event(wid,'database.created',{'engine':'postgresql'});return RedirectResponse(f'/servers/{wid}?tab=databases',303)
+    except Exception:
+        if sid:
+            try:await client.delete(sid)
+            except Exception:pass
+        raise
+@app.post('/servers/{wid}/databases/{database_id}/delete')
+async def delete_database(wid:int,database_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);row=db.get(ManagedDatabase,database_id)
+    if not row or row.workload_id!=wid:raise HTTPException(404)
+    await RailwayClient().delete(row.railway_service_id);variable=db.scalar(select(WorkloadVariable).where(WorkloadVariable.workload_id==wid,WorkloadVariable.name=='DATABASE_URL'))
+    if variable:db.delete(variable)
+    row.state='archived';audit(db,u,'database.service_delete',f'workload:{wid}',request.client.host if request.client else '',{'volume_retained':row.railway_volume_id});db.commit();await RailwayClient().upsert_variables(w.railway_service_id,{'DATABASE_URL':''});await RailwayClient().redeploy(w.railway_service_id);await dispatch_event(wid,'database.deleted',{});return RedirectResponse(f'/servers/{wid}?tab=databases',303)
 
 @app.post('/servers/{wid}/webhooks')
 def add_webhook(wid:int,request:Request,url:str=Form(...),secret_value:str=Form(...),events:str=Form('*'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):

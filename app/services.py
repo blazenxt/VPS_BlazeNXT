@@ -2,7 +2,7 @@ import json,secrets
 from datetime import datetime,timedelta,timezone
 from sqlalchemy import select
 from app.config import get_settings
-from app.models import AuditLog,Notification,Role,RunnerToken,State,WorkloadVariable
+from app.models import AuditLog,Notification,Role,RunnerToken,State,WorkloadAllocation,WorkloadVariable
 from app.railway import RailwayClient
 from app.security import decrypt_secret,hash_token
 s=get_settings(); QUOTAS={Role.user:2,Role.premium:20,Role.admin:100,Role.owner:1000}
@@ -17,7 +17,7 @@ async def provision(db,w):
     w.state=State.provisioning;db.commit();raw=issue_runner_token(db,w);db.commit()
     variables={'CONTROL_PLANE_URL':s.web_base_url.rstrip('/'),'RUNNER_TOKEN':raw,'WORKLOAD_ID':str(w.id),'ENTRYPOINT':w.entrypoint,'RUNTIME':w.runtime,**workload_variables(db,w.id)}
     try:
-        w.railway_service_id=await RailwayClient().create(f'blaze-{w.user_id}-{w.id}',variables);w.state=State.running;w.last_error=None
+        client=RailwayClient();w.railway_service_id=await client.create(f'blaze-{w.user_id}-{w.id}',variables);allocation=WorkloadAllocation(workload_id=w.id,cpu_vcpus=str(s.default_cpu_vcpus),memory_mb=s.default_memory_mb);db.add(allocation);db.commit();await client.update_limits(w.railway_service_id,s.default_cpu_vcpus,s.default_memory_mb);await client.update_instance(w.railway_service_id,1,'ON_FAILURE',5);w.state=State.running;w.last_error=None
         notify(db,w.user_id,'Deployment online',f'{w.name} was provisioned successfully.')
     except Exception as e:
         w.state=State.failed;w.last_error=str(e)[:1000];notify(db,w.user_id,'Deployment failed',f'{w.name}: {w.last_error}')
@@ -34,6 +34,8 @@ async def refresh_artifact(db,w):
     raw=issue_runner_token(db,w);db.commit();variables={'CONTROL_PLANE_URL':s.web_base_url.rstrip('/'),'RUNNER_TOKEN':raw,'WORKLOAD_ID':str(w.id),'ENTRYPOINT':w.entrypoint,'RUNTIME':w.runtime,**workload_variables(db,w.id)}
     await RailwayClient().upsert_variables(w.railway_service_id,variables);await RailwayClient().redeploy(w.railway_service_id);w.state=State.running;w.last_error=None;db.commit()
 async def perform_action(db,w,action):
+    allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==w.id))
+    if allocation and allocation.suspended and action!='delete':raise ValueError('Workload is suspended by an administrator')
     client=RailwayClient()
     if not w.railway_service_id:raise ValueError('Workload has no Railway service yet')
     if action in {'start','restart'}:await client.redeploy(w.railway_service_id);w.state=State.running

@@ -30,7 +30,9 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - User/premium/admin/owner roles, quotas and upgraded admin controls
 - Railway deployment history with validated rollback controls
 - KataBump-style plan catalog, manual upgrade ordering and synchronized support tickets
-- Trial-safe configurable global capacity guard (`GLOBAL_WORKLOAD_LIMIT`, default 3)
+- Railway Pro defaults: unlimited BlazeNXT workloads (`GLOBAL_WORKLOAD_LIMIT=0`), configurable CPU/RAM, replicas and restart policies
+- Managed per-workload PostgreSQL services with persistent Railway volumes and private `DATABASE_URL` injection
+- Suspend/unsuspend operations and retained-volume destructive-action safeguards
 - Admin support queue, user notifications, audit trail, health/readiness and Prometheus metrics
 - Docker Compose for local use, Railway config and GHCR runner workflow
 - Manual premium plans initially; billing can be added later
@@ -63,7 +65,7 @@ curl -H "Authorization: Bearer $BLAZENXT_API_KEY" https://hosting.blazenxt.in/ap
 curl -X POST -H "Authorization: Bearer $BLAZENXT_API_KEY" https://hosting.blazenxt.in/api/v1/servers/1/power/restart
 ```
 
-Webhook deliveries include `X-BlazeNXT-Event` and `X-BlazeNXT-Signature-256: sha256=<hmac>` headers. Database provisioning remains disabled by default because each database consumes another Railway service.
+Webhook deliveries include `X-BlazeNXT-Event` and `X-BlazeNXT-Signature-256: sha256=<hmac>` headers. On Railway Pro, database provisioning is enabled by default and each managed PostgreSQL database creates a separately billed service plus persistent volume. BlazeNXT intentionally retains database volumes when deleting their service.
 
 ## Local
 

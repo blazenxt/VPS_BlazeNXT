@@ -24,8 +24,11 @@ class Settings(BaseSettings):
     magic_link_ttl_seconds: int = Field(900, ge=300, le=3600)
     owner_ids: str = ''
     max_upload_mb: int = Field(10, ge=1, le=50)
-    global_workload_limit: int = Field(3, ge=0, le=1000)
-    enable_database_provisioning: bool = False
+    global_workload_limit: int = Field(0, ge=0, le=10000)
+    enable_database_provisioning: bool = True
+    default_cpu_vcpus: float = Field(0.5, ge=0.1, le=32)
+    default_memory_mb: int = Field(512, ge=128, le=131072)
+    max_databases_per_workload: int = Field(1, ge=0, le=10)
     session_ttl_seconds: int = Field(86400, ge=300, le=2592000)
     railway_api_token: str = ''
     railway_project_id: str = ''

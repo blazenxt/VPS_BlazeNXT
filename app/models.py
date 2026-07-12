@@ -81,6 +81,13 @@ class ApiKey(Base):
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
     name:Mapped[str]=mapped_column(String(80)); prefix:Mapped[str]=mapped_column(String(16),index=True); key_hash:Mapped[str]=mapped_column(String(64),unique=True,index=True); scopes:Mapped[str]=mapped_column(Text,default='["servers:read"]'); revoked:Mapped[bool]=mapped_column(Boolean,default=False)
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); last_used_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+class WorkloadAllocation(Base):
+    __tablename__='workload_allocations'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),unique=True,index=True)
+    cpu_vcpus:Mapped[str]=mapped_column(String(16),default='0.5'); memory_mb:Mapped[int]=mapped_column(Integer,default=512); replicas:Mapped[int]=mapped_column(Integer,default=1); restart_policy:Mapped[str]=mapped_column(String(30),default='ON_FAILURE'); restart_retries:Mapped[int]=mapped_column(Integer,default=5); suspended:Mapped[bool]=mapped_column(Boolean,default=False); maintenance:Mapped[bool]=mapped_column(Boolean,default=False); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+class ManagedDatabase(Base):
+    __tablename__='managed_databases'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True); engine:Mapped[str]=mapped_column(String(20),default='postgresql'); railway_service_id:Mapped[str]=mapped_column(String(80),unique=True); railway_volume_id:Mapped[str|None]=mapped_column(String(80)); service_name:Mapped[str]=mapped_column(String(80)); database_name:Mapped[str]=mapped_column(String(63)); username:Mapped[str]=mapped_column(String(63)); encrypted_password:Mapped[str]=mapped_column(Text); state:Mapped[str]=mapped_column(String(20),default='provisioning'); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
 class WorkloadWebhook(Base):
     __tablename__='workload_webhooks'
     id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True)
