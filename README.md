@@ -11,7 +11,9 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Multiple verified identities linked to one synchronized BlazeNXT account
 - Python, Node and ZIP uploads with size, zip-slip, zip-bomb and SHA-256 checks
 - Workload-scoped expiring artifact tokens, removed from the child process environment
-- Original Pterodactyl + Railway + KataBump-inspired responsive control plane
+- Premium Pterodactyl + Railway + KataBump-inspired responsive control plane
+- Persistent dark/light themes, collapsible navigation, Ctrl+K command palette and mobile workspace UI
+- Form progress states, drag/drop feedback, keyboard navigation and accessibility-focused controls
 - One synchronized identity and workload state across Telegram bot and website
 - Telegram bot auto-start verification (`getMe`), webhook registration, command registration and health reporting
 - Telegram file uploads, server lists, account/platform status, logs, backups and start/stop/restart controls
