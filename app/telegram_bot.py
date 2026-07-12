@@ -4,7 +4,8 @@ import httpx
 from sqlalchemy import func,select
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Artifact,Role,State,User,Workload
+from app.models import Artifact,Backup,Role,State,User,Workload
+from app.railway import RailwayClient
 from app.security import inspect_zip,safe_filename
 from app.services import audit,perform_action,provision,quota
 s=get_settings()
@@ -35,7 +36,7 @@ def servers_keyboard(rows):
     buttons.append([{'text':'🌐 Open web panel','url':s.web_base_url}]);return buttons
 def detail_text(w):
     return f"<b>{html.escape(w.name)}</b>\n\nStatus: <b>{w.state.value}</b>\nRuntime: <code>{w.runtime}</code>\nEntrypoint: <code>{html.escape(w.entrypoint)}</code>\nServer ID: <code>{w.id}</code>"
-def detail_keyboard(w):return [[{'text':'▶ Start','callback_data':f'act:start:{w.id}'},{'text':'↻ Restart','callback_data':f'act:restart:{w.id}'},{'text':'■ Stop','callback_data':f'act:stop:{w.id}'}],[{'text':'🖥 Open console','url':f"{s.web_base_url.rstrip('/')}/servers/{w.id}"},{'text':'‹ Servers','callback_data':'nav:servers'}]]
+def detail_keyboard(w):return [[{'text':'▶ Start','callback_data':f'act:start:{w.id}'},{'text':'↻ Restart','callback_data':f'act:restart:{w.id}'},{'text':'■ Stop','callback_data':f'act:stop:{w.id}'}],[{'text':'📜 Logs','callback_data':f'log:{w.id}'},{'text':'💾 Backup','callback_data':f'bak:{w.id}'}],[{'text':'🖥 Open panel','url':f"{s.web_base_url.rstrip('/')}/servers/{w.id}"},{'text':'‹ Servers','callback_data':'nav:servers'}]]
 async def send_user_notification(user_id,text):
     with SessionLocal() as db:
         u=db.get(User,user_id)
@@ -84,6 +85,15 @@ async def handle_update(update):
                     _,action,wid=data.split(':');w=db.get(Workload,int(wid))
                     if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
                     await perform_action(db,w,action);audit(db,u,f'workload.{action}.telegram',f'workload:{w.id}','telegram');db.commit();await edit(chat,mid,detail_text(w),detail_keyboard(w));return
+                if data.startswith('log:'):
+                    w=db.get(Workload,int(data.split(':')[1]))
+                    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
+                    deployments=await RailwayClient().deployments(w.railway_service_id) if w.railway_service_id else [];logs=await RailwayClient().logs(deployments[0]['id']) if deployments else []
+                    body='\n'.join(str(x.get('message','')) for x in logs[-30:])[-3500:] or 'No logs available.';await send(chat,f'📜 <b>{html.escape(w.name)} logs</b>\n<pre>{html.escape(body)}</pre>',detail_keyboard(w));return
+                if data.startswith('bak:'):
+                    w=db.get(Workload,int(data.split(':')[1]))
+                    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
+                    a=w.artifact;db.add(Backup(workload_id=w.id,name='Telegram backup',filename=a.filename,sha256=a.sha256,size=a.size,data=a.data));audit(db,u,'backup.create.telegram',f'workload:{w.id}','telegram');db.commit();await send(chat,f'💾 Backup created for <b>{html.escape(w.name)}</b>.',detail_keyboard(w));return
         if not message:return
         tg=message['from'];chat=message['chat']['id'];text=message.get('text','')
         with SessionLocal() as db:
@@ -93,6 +103,9 @@ async def handle_update(update):
                 await send(chat,f"🔥 <b>Welcome to BlazeNXT, {html.escape(u.display_name)}</b>\n\nYour Telegram bot and web panel are fully synchronized. Upload code here or manage deployments on the web.",[[{'text':'🖥 My servers','callback_data':'nav:servers'},{'text':'🌐 Web panel','url':s.web_base_url}],[{'text':'📦 Upload guide','callback_data':'nav:upload'}]]);return
             if text.startswith('/servers'):
                 rows=db.scalars(select(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all();await send(chat,'<b>Your workloads</b>',servers_keyboard(rows));return
+            if text.startswith('/status'):
+                rows=db.scalars(select(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)).all();online=sum(1 for w in rows if w.state==State.running);global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
+                await send(chat,f'📊 <b>BlazeNXT status</b>\n\nAccount: <b>{u.role.value}</b>\nYour workloads: <b>{len(rows)}</b>\nOnline: <b>{online}</b>\nYour quota: <b>{quota(u)}</b>\nPlatform capacity: <b>{global_active}/{s.global_workload_limit or "∞"}</b>',[[{'text':'My servers','callback_data':'nav:servers'},{'text':'Web dashboard','url':s.web_base_url}]]);return
             if text.startswith('/help') or text.startswith('/deploy'):
                 await send(chat,'<b>Deploy from Telegram</b>\n\nSend a <code>.py</code>, <code>.js</code> or <code>.zip</code> document. Optional caption:\n<code>name=MyBot runtime=python entry=main.py</code>\n\nSecrets and environment variables must be configured securely in the web panel.');return
             await send(chat,'Use /servers to manage workloads or send /help for the upload guide.')

@@ -14,17 +14,17 @@ from app.models import Artifact,AuditLog,Backup,Notification,Role,RunnerToken,Sc
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
-s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt')
+s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None}
 async def configure_telegram_webhook():
     import httpx
     webhook=f"{s.web_base_url.rstrip('/')}/telegram/webhook/{s.telegram_webhook_secret}"
     async with httpx.AsyncClient(timeout=15) as client:
-        response=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setWebhook',json={'url':webhook,'drop_pending_updates':False,'allowed_updates':['message','callback_query']})
-        response.raise_for_status();result=response.json()
+        identity=await client.post(f'https://api.telegram.org/bot{s.bot_token}/getMe');identity.raise_for_status();bot=identity.json()
+        if not bot.get('ok'):raise RuntimeError(bot.get('description','Telegram identity rejected'))
+        response=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setWebhook',json={'url':webhook,'drop_pending_updates':False,'allowed_updates':['message','callback_query']});response.raise_for_status();result=response.json()
         if not result.get('ok'):raise RuntimeError(result.get('description','Telegram rejected webhook'))
-        commands=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setMyCommands',json={'commands':[{'command':'start','description':'Open BlazeNXT control center'},{'command':'servers','description':'List and control workloads'},{'command':'deploy','description':'Upload and deploy code'},{'command':'help','description':'Show deployment help'}]})
-        commands.raise_for_status()
-    logger.info('Telegram webhook and commands configured for %s',s.web_base_url)
+        commands=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setMyCommands',json={'commands':[{'command':'start','description':'Open BlazeNXT control center'},{'command':'servers','description':'List and control workloads'},{'command':'status','description':'Platform and account status'},{'command':'deploy','description':'Upload and deploy code'},{'command':'help','description':'Show deployment help'}]});commands.raise_for_status()
+    info=bot['result'];BOT_RUNTIME.update({'online':True,'username':info.get('username'),'id':info.get('id'),'webhook':webhook,'error':None,'started_at':datetime.now(timezone.utc).isoformat()});logger.info('Telegram bot @%s started with webhook sync',info.get('username'))
 async def schedule_worker():
     while True:
         await asyncio.sleep(30)
@@ -44,11 +44,12 @@ async def lifespan(app):
     if s.production and ('change-me' in s.app_secret or not s.bot_token):raise RuntimeError('Production secrets are not configured')
     if s.bot_token and s.web_base_url.startswith('https://') and s.telegram_webhook_secret!='change-me':
         try:await configure_telegram_webhook()
-        except Exception:logger.exception('Automatic Telegram webhook configuration failed')
+        except Exception as e:BOT_RUNTIME.update({'online':False,'error':str(e)[:300]});logger.exception('Automatic Telegram bot startup failed')
+    else:BOT_RUNTIME.update({'online':False,'error':'Telegram variables or HTTPS base URL are incomplete'})
     scheduler=asyncio.create_task(schedule_worker())
     yield
     scheduler.cancel()
-app=FastAPI(title='BlazeNXT Control Plane',version='4.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
+app=FastAPI(title='BlazeNXT Control Plane',version='5.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.middleware('http')
 async def security_headers(request,call_next):
@@ -67,7 +68,7 @@ def csrf(request:Request,token:str=Form(...)):
     p=getattr(request.state,'session',None) or read_session(request.cookies.get('blaze_session',''))
     if not p or not secrets.compare_digest(p.get('csrf',''),token):raise HTTPException(403,'Invalid CSRF token')
 def ctx(request,user=None,**extra):
-    p=read_session(request.cookies.get('blaze_session','')) or {};return {'request':request,'user':user,'csrf':p.get('csrf',''),'bot_username':s.bot_username,**extra}
+    p=read_session(request.cookies.get('blaze_session','')) or {};return {'request':request,'user':user,'csrf':p.get('csrf',''),'bot_username':s.bot_username,'bot_runtime':BOT_RUNTIME,**extra}
 @app.get('/',response_class=HTMLResponse)
 def home(request:Request):return templates.TemplateResponse('home.html',ctx(request))
 @app.get('/auth/telegram')
@@ -112,7 +113,12 @@ async def run_provision(wid):
 async def action(wid:int,action:str,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     w=accessible_workload(wid,u,db,'control')
     if action=='delete' and w.user_id!=u.id and u.role not in {Role.admin,Role.owner}:raise HTTPException(403,'Only the owner can delete')
-    try:await perform_action(db,w,action);audit(db,u,f'workload.{action}',f'workload:{wid}',request.client.host if request.client else '');db.commit()
+    try:
+        await perform_action(db,w,action);audit(db,u,f'workload.{action}',f'workload:{wid}',request.client.host if request.client else '');db.commit()
+        try:
+            from app.telegram_bot import send_user_notification
+            await send_user_notification(w.user_id,f'🔄 <b>{w.name}</b>: {action} completed from web panel.')
+        except Exception:pass
     except Exception as e:w.last_error=str(e)[:1000];db.commit();raise HTTPException(502,str(e))
     return RedirectResponse(f'/servers/{wid}',303)
 @app.get('/api/workloads/{wid}/logs')
@@ -295,6 +301,8 @@ def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(Fals
 @app.get('/health/live')
 def live():return {'status':'ok'}
 @app.get('/health/ready')
-def ready(db:Session=Depends(get_db)):db.execute(select(1));return {'status':'ready','railway_configured':RailwayClient().configured}
+def ready(db:Session=Depends(get_db)):db.execute(select(1));return {'status':'ready','railway_configured':RailwayClient().configured,'telegram_online':BOT_RUNTIME['online']}
+@app.get('/health/bot')
+def bot_health():return {'online':BOT_RUNTIME['online'],'username':BOT_RUNTIME['username'],'started_at':BOT_RUNTIME['started_at'],'error':BOT_RUNTIME['error']}
 @app.get('/metrics')
 def metrics():return Response(generate_latest(),media_type=CONTENT_TYPE_LATEST)
