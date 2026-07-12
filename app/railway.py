@@ -22,6 +22,10 @@ class RailwayClient:
         q='mutation($input:ServiceInstanceLimitsUpdateInput!){serviceInstanceLimitsUpdate(input:$input)}';return await self.gql(q,{'input':{'serviceId':sid,'environmentId':self.s.railway_environment_id,'vCPUs':float(cpu_vcpus),'memoryGB':float(memory_mb)/1024}})
     async def update_instance(self,sid,replicas=1,restart_policy='ON_FAILURE',restart_retries=5):
         q='mutation($s:String!,$e:String!,$input:ServiceInstanceUpdateInput!){serviceInstanceUpdate(serviceId:$s,environmentId:$e,input:$input)}';return await self.gql(q,{'s':sid,'e':self.s.railway_environment_id,'input':{'numReplicas':replicas,'restartPolicyType':restart_policy,'restartPolicyMaxRetries':restart_retries}})
+    async def create_service_domain(self,sid):
+        q='mutation($input:ServiceDomainCreateInput!){serviceDomainCreate(input:$input){domain}}';d=await self.gql(q,{'input':{'serviceId':sid,'environmentId':self.s.railway_environment_id}});return d['serviceDomainCreate']['domain']
+    async def create_custom_domain(self,sid,domain):
+        q='mutation($input:CustomDomainCreateInput!){customDomainCreate(input:$input){id status{dnsRecords{hostlabel requiredValue}}}}';d=await self.gql(q,{'input':{'projectId':self.s.railway_project_id,'environmentId':self.s.railway_environment_id,'serviceId':sid,'domain':domain}});return d['customDomainCreate']
     async def upsert_variables(self,sid,variables):
         q='mutation($input:VariableCollectionUpsertInput!){variableCollectionUpsert(input:$input)}'
         return await self.gql(q,{'input':{'projectId':self.s.railway_project_id,'environmentId':self.s.railway_environment_id,'serviceId':sid,'variables':variables}})

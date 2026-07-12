@@ -98,6 +98,12 @@ class WebhookDelivery(Base):
 class UserSecurity(Base):
     __tablename__='user_security'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); encrypted_totp_secret:Mapped[str]=mapped_column(Text); enabled:Mapped[bool]=mapped_column(Boolean,default=False); encrypted_recovery_codes:Mapped[str]=mapped_column(Text); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class StagedChange(Base):
+    __tablename__='staged_changes'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True); environment:Mapped[str]=mapped_column(String(40),default='production'); kind:Mapped[str]=mapped_column(String(30)); payload:Mapped[str]=mapped_column(Text); status:Mapped[str]=mapped_column(String(20),default='pending',index=True); commit_message:Mapped[str|None]=mapped_column(String(200)); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); applied_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+class WorkloadDomain(Base):
+    __tablename__='workload_domains'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True); domain:Mapped[str]=mapped_column(String(253)); railway_domain_id:Mapped[str|None]=mapped_column(String(80)); kind:Mapped[str]=mapped_column(String(20),default='custom'); dns_records:Mapped[str]=mapped_column(Text,default='[]'); status:Mapped[str]=mapped_column(String(30),default='pending'); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

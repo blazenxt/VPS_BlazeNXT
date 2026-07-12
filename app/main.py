@@ -14,7 +14,7 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import ApiKey,Artifact,AuditLog,AuthIdentity,Backup,ManagedDatabase,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,WebhookDelivery,Workload,WorkloadAllocation,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import ApiKey,Artifact,AuditLog,AuthIdentity,Backup,ManagedDatabase,Notification,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,User,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
@@ -102,6 +102,60 @@ def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)
     notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
     global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;visible_ids=[w.id for w in ws];allocations=db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(visible_ids))).all() if visible_ids else [];container_count=sum(x.replicas for x in allocations)+(len(ws)-len(allocations))
     return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,container_count=container_count,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS))
+def visible_workloads(db,u,scope='mine'):
+    if scope=='all' and u.role in {Role.admin,Role.owner}:return db.scalars(select(Workload).where(Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
+    shared=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all();return db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
+@app.get('/project',response_class=HTMLResponse)
+def project_canvas(request:Request,scope:str='mine',u:User=Depends(current),db:Session=Depends(get_db)):
+    workloads=visible_workloads(db,u,scope);ids=[w.id for w in workloads];allocations={x.workload_id:x for x in db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(ids))).all()} if ids else {};databases=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id.in_(ids))).all() if ids else [];domains=db.scalars(select(WorkloadDomain).where(WorkloadDomain.workload_id.in_(ids))).all() if ids else [];pending=db.scalar(select(func.count()).select_from(StagedChange).where(StagedChange.user_id==u.id,StagedChange.status=='pending')) or 0
+    return templates.TemplateResponse('project.html',ctx(request,u,workloads=workloads,allocations=allocations,databases=databases,domains=domains,scope=scope,pending=pending))
+@app.get('/observability',response_class=HTMLResponse)
+def observability(request:Request,scope:str='mine',u:User=Depends(current),db:Session=Depends(get_db)):
+    workloads=visible_workloads(db,u,scope);ids=[w.id for w in workloads];allocations=db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(ids))).all() if ids else [];events=db.scalars(select(AuditLog).where(AuditLog.target.in_([f'workload:{x}' for x in ids])).order_by(AuditLog.created_at.desc()).limit(100)).all() if ids else [];hooks=db.scalars(select(WorkloadWebhook.id).where(WorkloadWebhook.workload_id.in_(ids))).all() if ids else [];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hooks)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hooks else []
+    stats={'total':len(workloads),'online':sum(w.state==State.running for w in workloads),'failed':sum(w.state==State.failed for w in workloads),'containers':sum(a.replicas for a in allocations)+(len(workloads)-len(allocations)),'memory_mb':sum(a.memory_mb*a.replicas for a in allocations),'cpu':sum(float(a.cpu_vcpus)*a.replicas for a in allocations)}
+    return templates.TemplateResponse('observability.html',ctx(request,u,workloads=workloads,events=events,deliveries=deliveries,stats=stats,scope=scope))
+@app.get('/api/observability')
+def observability_api(scope:str='mine',u:User=Depends(current),db:Session=Depends(get_db)):
+    rows=visible_workloads(db,u,scope);return {'services':[{'id':w.id,'name':w.name,'state':w.state.value,'updated_at':w.updated_at} for w in rows],'summary':{'total':len(rows),'online':sum(w.state==State.running for w in rows),'failed':sum(w.state==State.failed for w in rows)}}
+@app.get('/changes',response_class=HTMLResponse)
+def changes(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    rows=db.scalars(select(StagedChange).where(StagedChange.user_id==u.id,StagedChange.status=='pending').order_by(StagedChange.created_at.desc())).all();workloads=visible_workloads(db,u);return templates.TemplateResponse('changes.html',ctx(request,u,changes=rows,workloads=workloads,presets=PRESETS))
+@app.post('/changes')
+def stage_change(request:Request,workload_id:int=Form(...),kind:str=Form(...),runtime:str=Form(''),entrypoint:str=Form(''),cpu_vcpus:str=Form(''),memory_mb:str=Form(''),replicas:str=Form(''),restart_policy:str=Form('ON_FAILURE'),variable_name:str=Form(''),variable_value:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=accessible_workload(workload_id,u,db,'control');payload={}
+    if kind=='startup':
+        if runtime not in {'python','node'}:raise HTTPException(400,'Invalid runtime')
+        try:clean_entrypoint=safe_filename(entrypoint)
+        except ValueError as e:raise HTTPException(400,str(e))
+        payload={'runtime':runtime,'entrypoint':clean_entrypoint}
+    elif kind=='resources':
+        try:cpu=float(cpu_vcpus);memory=int(memory_mb);replica_count=int(replicas)
+        except ValueError:raise HTTPException(400,'Invalid resource values')
+        if not 0.1<=cpu<=32 or not 128<=memory<=131072 or not 1<=replica_count<=20 or restart_policy not in {'ON_FAILURE','ALWAYS','NEVER'}:raise HTTPException(400,'Resource values outside allowed range')
+        payload={'cpu_vcpus':cpu,'memory_mb':memory,'replicas':replica_count,'restart_policy':restart_policy,'restart_retries':5}
+    elif kind=='variable':
+        name=variable_name.strip().upper()
+        if not re.fullmatch(r'[A-Z_][A-Z0-9_]{0,79}',name) or name in {'CONTROL_PLANE_URL','RUNNER_TOKEN','WORKLOAD_ID','ENTRYPOINT','RUNTIME'}:raise HTTPException(400,'Invalid or reserved variable name')
+        payload={'name':name,'value':variable_value}
+    else:raise HTTPException(400,'Unsupported change type')
+    db.add(StagedChange(user_id=u.id,workload_id=w.id,kind=kind,payload=json.dumps(payload)));audit(db,u,'change.stage',f'workload:{w.id}',request.client.host if request.client else '',{'kind':kind});db.commit();return RedirectResponse('/changes',303)
+@app.post('/changes/apply')
+async def apply_changes(request:Request,commit_message:str=Form('Apply staged changes'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    rows=db.scalars(select(StagedChange).where(StagedChange.user_id==u.id,StagedChange.status=='pending').order_by(StagedChange.created_at)).all()
+    for change in rows:
+        w=accessible_workload(change.workload_id,u,db,'control');data=json.loads(change.payload);client=RailwayClient()
+        if change.kind=='startup':w.runtime=data['runtime'];w.entrypoint=data['entrypoint'];await refresh_artifact(db,w)
+        elif change.kind=='resources':
+            await client.update_limits(w.railway_service_id,data['cpu_vcpus'],data['memory_mb']);await client.update_instance(w.railway_service_id,data['replicas'],data['restart_policy'],data['restart_retries']);allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==w.id)) or WorkloadAllocation(workload_id=w.id);db.add(allocation);allocation.cpu_vcpus=str(data['cpu_vcpus']);allocation.memory_mb=data['memory_mb'];allocation.replicas=data['replicas'];allocation.restart_policy=data['restart_policy']
+        elif change.kind=='variable':
+            variable=db.scalar(select(WorkloadVariable).where(WorkloadVariable.workload_id==w.id,WorkloadVariable.name==data['name'])) or WorkloadVariable(workload_id=w.id,name=data['name']);db.add(variable);variable.encrypted_value=encrypt_secret(data['value']);variable.is_secret=True;await client.upsert_variables(w.railway_service_id,{data['name']:data['value']});await client.redeploy(w.railway_service_id)
+        change.status='applied';change.commit_message=commit_message[:200];change.applied_at=datetime.now(timezone.utc);audit(db,u,'change.apply',f'workload:{w.id}',request.client.host if request.client else '',{'kind':change.kind});db.commit()
+    return RedirectResponse('/project',303)
+@app.post('/changes/{change_id}/discard')
+def discard_change(change_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    row=db.get(StagedChange,change_id)
+    if not row or row.user_id!=u.id or row.status!='pending':raise HTTPException(404)
+    row.status='discarded';audit(db,u,'change.discard',f'workload:{row.workload_id}',request.client.host if request.client else '');db.commit();return RedirectResponse('/changes',303)
 @app.post('/workloads')
 async def upload(request:Request,bg:BackgroundTasks,name:str=Form(...),runtime:str=Form(...),entrypoint:str=Form(...),preset:str=Form('custom'),file:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     active=db.scalar(select(func.count()).select_from(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)) or 0
@@ -210,9 +264,9 @@ async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends
     backups=db.scalars(select(Backup).where(Backup.workload_id==wid).order_by(Backup.created_at.desc())).all()
     members=db.scalars(select(WorkloadMember).where(WorkloadMember.workload_id==wid)).all()
     schedules=db.scalars(select(Schedule).where(Schedule.workload_id==wid).order_by(Schedule.created_at.desc())).all()
-    allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid));databases=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id==wid).order_by(ManagedDatabase.created_at.desc())).all();webhooks=db.scalars(select(WorkloadWebhook).where(WorkloadWebhook.workload_id==wid).order_by(WorkloadWebhook.created_at.desc())).all();hook_ids=[x.id for x in webhooks];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hook_ids)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hook_ids else []
+    allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid));databases=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id==wid).order_by(ManagedDatabase.created_at.desc())).all();domains=db.scalars(select(WorkloadDomain).where(WorkloadDomain.workload_id==wid).order_by(WorkloadDomain.created_at.desc())).all();webhooks=db.scalars(select(WorkloadWebhook).where(WorkloadWebhook.workload_id==wid).order_by(WorkloadWebhook.created_at.desc())).all();hook_ids=[x.id for x in webhooks];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hook_ids)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hook_ids else []
     is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
-    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning,allocation=allocation,databases=databases,active_database_count=sum(1 for d in databases if d.state=='active'),max_databases=s.max_databases_per_workload))
+    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning,allocation=allocation,databases=databases,domains=domains,active_database_count=sum(1 for d in databases if d.state=='active'),max_databases=s.max_databases_per_workload))
 
 @app.get('/servers/{wid}/download')
 def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
@@ -389,6 +443,19 @@ async def delete_database(wid:int,database_id:int,request:Request,u:User=Depends
     await RailwayClient().delete(row.railway_service_id);variable=db.scalar(select(WorkloadVariable).where(WorkloadVariable.workload_id==wid,WorkloadVariable.name=='DATABASE_URL'))
     if variable:db.delete(variable)
     row.state='archived';audit(db,u,'database.service_delete',f'workload:{wid}',request.client.host if request.client else '',{'volume_retained':row.railway_volume_id});db.commit();await RailwayClient().upsert_variables(w.railway_service_id,{'DATABASE_URL':''});await RailwayClient().redeploy(w.railway_service_id);await dispatch_event(wid,'database.deleted',{});return RedirectResponse(f'/servers/{wid}?tab=databases',303)
+
+@app.post('/servers/{wid}/domains')
+async def create_domain(wid:int,request:Request,kind:str=Form(...),domain:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    if not w.railway_service_id:raise HTTPException(400,'Service is not provisioned')
+    client=RailwayClient()
+    if kind=='railway':name=await client.create_service_domain(w.railway_service_id);row=WorkloadDomain(workload_id=wid,domain=name,kind='railway',status='active')
+    elif kind=='custom':
+        domain=domain.strip().lower()
+        if not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}',domain):raise HTTPException(400,'Invalid domain')
+        result=await client.create_custom_domain(w.railway_service_id,domain);records=(result.get('status') or {}).get('dnsRecords') or [];row=WorkloadDomain(workload_id=wid,domain=domain,railway_domain_id=result.get('id'),kind='custom',dns_records=json.dumps(records),status='pending_dns')
+    else:raise HTTPException(400,'Invalid domain type')
+    db.add(row);audit(db,u,'domain.create',f'workload:{wid}',request.client.host if request.client else '',{'domain':row.domain,'kind':kind});db.commit();return RedirectResponse(f'/servers/{wid}?tab=network',303)
 
 @app.post('/servers/{wid}/webhooks')
 def add_webhook(wid:int,request:Request,url:str=Form(...),secret_value:str=Form(...),events:str=Form('*'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
