@@ -6,7 +6,9 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 
 ## Included
 
-- Telegram Login verification, signed HttpOnly sessions, CSRF and rate limiting
+- Telegram Login, Google OAuth, GitHub OAuth and one-time email magic links
+- Signed HttpOnly sessions, OAuth state/session binding, CSRF protection and rate limiting
+- Multiple verified identities linked to one synchronized BlazeNXT account
 - Python, Node and ZIP uploads with size, zip-slip, zip-bomb and SHA-256 checks
 - Workload-scoped expiring artifact tokens, removed from the child process environment
 - Original Pterodactyl + Railway + KataBump-inspired responsive control plane
@@ -38,12 +40,13 @@ Railway does not support safe Docker-in-Docker in a normal app service. Isolatio
 1. Add Railway Postgres and deploy this repository as the control-plane service.
 2. Copy `.env.example` into Railway variables. Generate `APP_SECRET` with `openssl rand -hex 32`.
 3. Set `WEB_BASE_URL=https://hosting.blazenxt.in`, Telegram values and `OWNER_IDS`.
-4. Set a Railway account/workspace API token plus `RAILWAY_PROJECT_ID` and `RAILWAY_ENVIRONMENT_ID`. This is a high-impact secret.
-5. Let GitHub Actions publish `ghcr.io/blazenxt/vps-blazenxt-runner:latest`; make the package public or configure registry credentials in Railway.
-6. Add `hosting.blazenxt.in` as a Railway custom domain and follow Railway's DNS instructions.
-7. In BotFather use `/setdomain` with `hosting.blazenxt.in`.
-8. Deploy or restart the service. On startup, the control plane securely registers its Telegram webhook from `WEB_BASE_URL` and `TELEGRAM_WEBHOOK_SECRET`; no manual curl command is needed.
-9. Confirm `/health/ready` returns ready and check the deployment log for `Telegram webhook configured` before enabling users.
+4. Optionally configure Google callback `https://hosting.blazenxt.in/auth/google/callback`, GitHub callback `https://hosting.blazenxt.in/auth/github/callback`, and SMTP variables for email magic links.
+5. Set a Railway account/workspace API token plus `RAILWAY_PROJECT_ID` and `RAILWAY_ENVIRONMENT_ID`. This is a high-impact secret.
+6. Let GitHub Actions publish `ghcr.io/blazenxt/vps-blazenxt-runner:latest`; make the package public or configure registry credentials in Railway.
+7. Add `hosting.blazenxt.in` as a Railway custom domain and follow Railway's DNS instructions.
+8. In BotFather use `/setdomain` with `hosting.blazenxt.in`.
+9. Deploy or restart the service. On startup, the control plane securely registers its Telegram webhook from `WEB_BASE_URL` and `TELEGRAM_WEBHOOK_SECRET`; no manual curl command is needed.
+10. Confirm `/health/ready` returns ready and check the deployment log for `Telegram bot ... started with webhook sync` before enabling users.
 
 Without Railway variables, the dashboard works but deployments safely enter `failed` with a provider-not-configured error.
 

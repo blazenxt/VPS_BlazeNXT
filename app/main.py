@@ -9,9 +9,10 @@ from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST,Counter,generate_latest
 from sqlalchemy import func,select
 from sqlalchemy.orm import Session
+from app.auth import providers as auth_providers,router as auth_router
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Artifact,AuditLog,Backup,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,Workload,WorkloadMember,WorkloadVariable
+from app.models import Artifact,AuditLog,AuthIdentity,Backup,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,Workload,WorkloadMember,WorkloadVariable
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
@@ -50,7 +51,7 @@ async def lifespan(app):
     scheduler=asyncio.create_task(schedule_worker())
     yield
     scheduler.cancel()
-app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
+app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.middleware('http')
 async def security_headers(request,call_next):
@@ -71,14 +72,22 @@ def csrf(request:Request,token:str=Form(...)):
 def ctx(request,user=None,**extra):
     p=read_session(request.cookies.get('blaze_session','')) or {};return {'request':request,'user':user,'csrf':p.get('csrf',''),'bot_username':s.bot_username,'bot_runtime':BOT_RUNTIME,**extra}
 @app.get('/',response_class=HTMLResponse)
-def home(request:Request):return templates.TemplateResponse('home.html',ctx(request))
+def home(request:Request):return templates.TemplateResponse('home.html',ctx(request,auth_providers=auth_providers()))
 @app.get('/auth/telegram')
 def auth(request:Request,db:Session=Depends(get_db)):
     data=dict(request.query_params)
     if not s.bot_token or not verify_telegram(data):raise HTTPException(401,'Invalid or expired Telegram login')
-    tid=int(data['id']);u=db.scalar(select(User).where(User.telegram_id==tid));name=' '.join(filter(None,[data.get('first_name'),data.get('last_name')])) or 'User'
+    tid=int(data['id']);existing=db.scalar(select(User).where(User.telegram_id==tid));session=read_session(request.cookies.get('blaze_session',''));linked=db.get(User,int(session['uid'])) if session else None;name=' '.join(filter(None,[data.get('first_name'),data.get('last_name')])) or 'User'
+    if linked and existing and linked.id!=existing.id:raise HTTPException(409,'This Telegram account is already linked to another BlazeNXT user')
+    if linked and linked.telegram_id>=0 and linked.telegram_id!=tid:raise HTTPException(409,'A different Telegram account is already linked')
+    if linked and not existing:
+        u=linked
+        if u.telegram_id<0:u.telegram_id=tid
+    else:u=existing
     if not u:u=User(telegram_id=tid,username=data.get('username'),display_name=name,role=Role.owner if tid in s.owners else Role.user);db.add(u)
     else:u.username=data.get('username');u.display_name=name;u.role=Role.owner if tid in s.owners else u.role
+    db.flush();identity=db.scalar(select(AuthIdentity).where(AuthIdentity.provider=='telegram',AuthIdentity.subject==str(tid)))
+    if not identity:db.add(AuthIdentity(user_id=u.id,provider='telegram',subject=str(tid),display_name=name,avatar_url=data.get('photo_url')))
     db.commit();db.refresh(u);audit(db,u,'login','web',request.client.host if request.client else '');db.commit();r=RedirectResponse('/dashboard',303);r.set_cookie('blaze_session',sign_session(u.id),httponly=True,secure=s.production,samesite='lax',max_age=s.session_ttl_seconds);return r
 @app.post('/logout')
 def logout(request:Request,u=Depends(current),_=Depends(csrf)):

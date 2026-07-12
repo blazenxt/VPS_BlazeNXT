@@ -11,6 +11,17 @@ class Settings(BaseSettings):
     bot_token: str = ''
     bot_username: str = ''
     telegram_webhook_secret: str = 'change-me'
+    google_client_id: str = ''
+    google_client_secret: str = ''
+    github_client_id: str = ''
+    github_client_secret: str = ''
+    smtp_host: str = ''
+    smtp_port: int = Field(587, ge=1, le=65535)
+    smtp_username: str = ''
+    smtp_password: str = ''
+    smtp_from: str = ''
+    smtp_starttls: bool = True
+    magic_link_ttl_seconds: int = Field(900, ge=300, le=3600)
     owner_ids: str = ''
     max_upload_mb: int = Field(10, ge=1, le=50)
     global_workload_limit: int = Field(3, ge=0, le=1000)

@@ -67,6 +67,15 @@ class Notification(Base):
     __tablename__='notifications'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
     title:Mapped[str]=mapped_column(String(120)); message:Mapped[str]=mapped_column(Text); read:Mapped[bool]=mapped_column(Boolean,default=False); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class AuthIdentity(Base):
+    __tablename__='auth_identities'; __table_args__=(UniqueConstraint('provider','subject'),)
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
+    provider:Mapped[str]=mapped_column(String(20),index=True); subject:Mapped[str]=mapped_column(String(255)); email:Mapped[str|None]=mapped_column(String(320),index=True); display_name:Mapped[str|None]=mapped_column(String(128)); avatar_url:Mapped[str|None]=mapped_column(Text)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); last_login_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+    user:Mapped[User]=relationship()
+class AuthTokenUse(Base):
+    __tablename__='auth_token_uses'
+    id:Mapped[int]=mapped_column(primary_key=True); token_hash:Mapped[str]=mapped_column(String(64),unique=True,index=True); used_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
