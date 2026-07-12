@@ -4,7 +4,7 @@ import httpx
 from sqlalchemy import func,select
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Artifact,Backup,Role,State,User,Workload
+from app.models import Artifact,Backup,PlatformSetting,Role,State,User,Workload
 from app.railway import RailwayClient
 from app.security import inspect_zip,safe_filename
 from app.services import audit,perform_action,provision,quota
@@ -50,6 +50,8 @@ async def handle_document(message,u,db):
     doc=message['document'];name=safe_filename(doc.get('file_name') or 'upload.zip')
     if doc.get('file_size',0)>s.max_upload_mb*1024*1024:raise ValueError(f'File exceeds {s.max_upload_mb} MB limit')
     active=db.scalar(select(func.count()).select_from(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)) or 0
+    switch=db.get(PlatformSetting,'deployments_enabled')
+    if switch and switch.value!='true':raise ValueError('New deployments are temporarily disabled')
     global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
     if s.global_workload_limit and global_active>=s.global_workload_limit:raise ValueError('Platform capacity reached. Contact the administrator.')
     if active>=quota(u):raise ValueError('Workload quota reached')

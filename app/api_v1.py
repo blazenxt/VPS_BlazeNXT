@@ -4,7 +4,7 @@ from fastapi.security import HTTPAuthorizationCredentials,HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.db import get_db
-from app.models import ApiKey,Role,State,User,Workload
+from app.models import ApiKey,ApiRequestLog,Role,State,User,Workload
 from app.security import hash_token
 from app.services import audit,perform_action
 from app.webhooks import dispatch_event
@@ -20,18 +20,20 @@ def require(key,scope):
     import json
     scopes=json.loads(key.scopes)
     if scope not in scopes and '*' not in scopes:raise HTTPException(403,f'Missing scope: {scope}')
+def record_request(db,key,request,status=200):
+    db.add(ApiRequestLog(api_key_id=key.id,method=request.method,path=request.url.path,status_code=status,ip=request.client.host if request.client else 'unknown'));db.commit()
 @router.get('/servers')
-def servers(identity=Depends(api_identity),db:Session=Depends(get_db)):
-    user,key=identity;require(key,'servers:read');rows=db.scalars(select(Workload).where(Workload.user_id==user.id,Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
+def servers(request:Request,identity=Depends(api_identity),db:Session=Depends(get_db)):
+    user,key=identity;require(key,'servers:read');rows=db.scalars(select(Workload).where(Workload.user_id==user.id,Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all();record_request(db,key,request)
     return {'data':[{'id':w.id,'name':w.name,'state':w.state.value,'runtime':w.runtime,'entrypoint':w.entrypoint,'created_at':w.created_at} for w in rows]}
 @router.get('/servers/{wid}')
-def server(wid:int,identity=Depends(api_identity),db:Session=Depends(get_db)):
+def server(wid:int,request:Request,identity=Depends(api_identity),db:Session=Depends(get_db)):
     user,key=identity;require(key,'servers:read');w=db.get(Workload,wid)
     if not w or (w.user_id!=user.id and user.role not in {Role.admin,Role.owner}):raise HTTPException(404)
-    return {'data':{'id':w.id,'name':w.name,'state':w.state.value,'runtime':w.runtime,'entrypoint':w.entrypoint,'service_id':w.railway_service_id,'last_error':w.last_error}}
+    record_request(db,key,request);return {'data':{'id':w.id,'name':w.name,'state':w.state.value,'runtime':w.runtime,'entrypoint':w.entrypoint,'service_id':w.railway_service_id,'last_error':w.last_error}}
 @router.post('/servers/{wid}/power/{action}')
 async def power(wid:int,action:str,request:Request,identity=Depends(api_identity),db:Session=Depends(get_db)):
     user,key=identity;require(key,'servers:control');w=db.get(Workload,wid)
     if not w or (w.user_id!=user.id and user.role not in {Role.admin,Role.owner}):raise HTTPException(404)
     if action not in {'start','stop','restart'}:raise HTTPException(400,'Invalid power action')
-    await perform_action(db,w,action);audit(db,user,f'workload.{action}.api',f'workload:{wid}',request.client.host if request.client else 'api',{'api_key':key.prefix});db.commit();await dispatch_event(wid,f'workload.{action}',{'source':'api'});return {'data':{'id':w.id,'state':w.state.value}}
+    await perform_action(db,w,action);audit(db,user,f'workload.{action}.api',f'workload:{wid}',request.client.host if request.client else 'api',{'api_key':key.prefix});db.commit();record_request(db,key,request);await dispatch_event(wid,f'workload.{action}',{'source':'api'});return {'data':{'id':w.id,'state':w.state.value}}

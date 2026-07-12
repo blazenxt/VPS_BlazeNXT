@@ -2,7 +2,7 @@ import json,secrets
 from datetime import datetime,timedelta,timezone
 from sqlalchemy import select
 from app.config import get_settings
-from app.models import AuditLog,Notification,Role,RunnerToken,State,WorkloadAllocation,WorkloadVariable
+from app.models import AuditLog,Notification,PlatformSetting,Role,RunnerToken,State,WorkloadAllocation,WorkloadVariable
 from app.railway import RailwayClient
 from app.security import decrypt_secret,hash_token
 s=get_settings(); QUOTAS={Role.user:2,Role.premium:20,Role.admin:100,Role.owner:1000}
@@ -14,6 +14,8 @@ def workload_variables(db,wid):
 def issue_runner_token(db,w):
     raw=secrets.token_urlsafe(32);db.add(RunnerToken(workload_id=w.id,token_hash=hash_token(raw),expires_at=datetime.now(timezone.utc)+timedelta(seconds=s.runner_token_ttl_seconds)));return raw
 async def provision(db,w):
+    switch=db.get(PlatformSetting,'deployments_enabled')
+    if switch and switch.value!='true':w.state=State.failed;w.last_error='Deployments are disabled by an administrator';db.commit();return
     w.state=State.provisioning;db.commit();raw=issue_runner_token(db,w);db.commit()
     variables={'CONTROL_PLANE_URL':s.web_base_url.rstrip('/'),'RUNNER_TOKEN':raw,'WORKLOAD_ID':str(w.id),'ENTRYPOINT':w.entrypoint,'RUNTIME':w.runtime,**workload_variables(db,w.id)}
     try:
@@ -34,6 +36,8 @@ async def refresh_artifact(db,w):
     raw=issue_runner_token(db,w);db.commit();variables={'CONTROL_PLANE_URL':s.web_base_url.rstrip('/'),'RUNNER_TOKEN':raw,'WORKLOAD_ID':str(w.id),'ENTRYPOINT':w.entrypoint,'RUNTIME':w.runtime,**workload_variables(db,w.id)}
     await RailwayClient().upsert_variables(w.railway_service_id,variables);await RailwayClient().redeploy(w.railway_service_id);w.state=State.running;w.last_error=None;db.commit()
 async def perform_action(db,w,action):
+    switch=db.get(PlatformSetting,'deployments_enabled')
+    if switch and switch.value!='true' and action in {'start','restart'}:raise ValueError('Power-on operations are disabled by an administrator')
     allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==w.id))
     if allocation and allocation.suspended and action!='delete':raise ValueError('Workload is suspended by an administrator')
     client=RailwayClient()

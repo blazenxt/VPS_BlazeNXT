@@ -39,6 +39,10 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Railway Pro defaults: unlimited BlazeNXT workloads (`GLOBAL_WORKLOAD_LIMIT=0`), configurable CPU/RAM, replicas and restart policies
 - Managed per-workload PostgreSQL services with persistent Railway volumes and private `DATABASE_URL` injection
 - Suspend/unsuspend operations and retained-volume destructive-action safeguards
+- Public aggregate status page, health snapshots, incident history and maintenance announcements
+- Notification center with web/Telegram broadcasts and dashboard notices
+- Customer portal with onboarding, referral credits, plan history, API usage and recent sign-ins
+- Admin emergency deployment switch, incident controls and CSV audit export
 - Admin support queue, user notifications, audit trail, health/readiness and Prometheus metrics
 - Docker Compose for local use, Railway config and GHCR runner workflow
 - Manual premium plans initially; billing can be added later

@@ -104,6 +104,33 @@ class StagedChange(Base):
 class WorkloadDomain(Base):
     __tablename__='workload_domains'
     id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True); domain:Mapped[str]=mapped_column(String(253)); railway_domain_id:Mapped[str|None]=mapped_column(String(80)); kind:Mapped[str]=mapped_column(String(20),default='custom'); dns_records:Mapped[str]=mapped_column(Text,default='[]'); status:Mapped[str]=mapped_column(String(30),default='pending'); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class PlatformSetting(Base):
+    __tablename__='platform_settings'
+    key:Mapped[str]=mapped_column(String(80),primary_key=True); value:Mapped[str]=mapped_column(Text); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+class Incident(Base):
+    __tablename__='incidents'
+    id:Mapped[int]=mapped_column(primary_key=True); title:Mapped[str]=mapped_column(String(160)); message:Mapped[str]=mapped_column(Text); status:Mapped[str]=mapped_column(String(30),default='investigating'); impact:Mapped[str]=mapped_column(String(20),default='minor'); created_by:Mapped[int|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL')); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); resolved_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+class Announcement(Base):
+    __tablename__='announcements'
+    id:Mapped[int]=mapped_column(primary_key=True); title:Mapped[str]=mapped_column(String(160)); message:Mapped[str]=mapped_column(Text); level:Mapped[str]=mapped_column(String(20),default='info'); active:Mapped[bool]=mapped_column(Boolean,default=True,index=True); created_by:Mapped[int|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL')); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class HealthSnapshot(Base):
+    __tablename__='health_snapshots'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True); state:Mapped[str]=mapped_column(String(20)); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class Wallet(Base):
+    __tablename__='wallets'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); credits:Mapped[int]=mapped_column(Integer,default=0); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+class ReferralCode(Base):
+    __tablename__='referral_codes'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); code:Mapped[str]=mapped_column(String(32),unique=True,index=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class ReferralRedemption(Base):
+    __tablename__='referral_redemptions'
+    id:Mapped[int]=mapped_column(primary_key=True); code_id:Mapped[int]=mapped_column(ForeignKey('referral_codes.id',ondelete='CASCADE')); referred_user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class PlanEvent(Base):
+    __tablename__='plan_events'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); old_plan:Mapped[str]=mapped_column(String(20)); new_plan:Mapped[str]=mapped_column(String(20)); changed_by:Mapped[int|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL')); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class ApiRequestLog(Base):
+    __tablename__='api_request_logs'
+    id:Mapped[int]=mapped_column(primary_key=True); api_key_id:Mapped[int]=mapped_column(ForeignKey('api_keys.id',ondelete='CASCADE'),index=True); method:Mapped[str]=mapped_column(String(10)); path:Mapped[str]=mapped_column(String(255)); status_code:Mapped[int]=mapped_column(Integer); ip:Mapped[str]=mapped_column(String(64)); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
