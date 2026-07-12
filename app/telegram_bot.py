@@ -48,6 +48,8 @@ async def handle_document(message,u,db):
     doc=message['document'];name=safe_filename(doc.get('file_name') or 'upload.zip')
     if doc.get('file_size',0)>s.max_upload_mb*1024*1024:raise ValueError(f'File exceeds {s.max_upload_mb} MB limit')
     active=db.scalar(select(func.count()).select_from(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)) or 0
+    global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
+    if s.global_workload_limit and global_active>=s.global_workload_limit:raise ValueError('Platform capacity reached. Contact the administrator.')
     if active>=quota(u):raise ValueError('Workload quota reached')
     caption=message.get('caption','');opts=dict(re.findall(r'(name|entry|runtime)=([^\s]+)',caption))
     runtime=opts.get('runtime') or ('node' if name.endswith('.js') else 'python')

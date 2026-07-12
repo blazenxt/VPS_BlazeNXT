@@ -10,7 +10,7 @@ from sqlalchemy import func,select
 from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Artifact,AuditLog,Backup,Notification,Role,RunnerToken,Schedule,State,User,Workload,WorkloadMember,WorkloadVariable
+from app.models import Artifact,AuditLog,Backup,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,Workload,WorkloadMember,WorkloadVariable
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
@@ -48,7 +48,7 @@ async def lifespan(app):
     scheduler=asyncio.create_task(schedule_worker())
     yield
     scheduler.cancel()
-app=FastAPI(title='BlazeNXT Control Plane',version='3.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
+app=FastAPI(title='BlazeNXT Control Plane',version='4.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.middleware('http')
 async def security_headers(request,call_next):
@@ -86,10 +86,13 @@ def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)
     shared_ids=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all()
     ws=db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared_ids)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
     notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
-    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,quota=quota(u),notifications=notes))
+    global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
+    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit))
 @app.post('/workloads')
 async def upload(request:Request,bg:BackgroundTasks,name:str=Form(...),runtime:str=Form(...),entrypoint:str=Form(...),file:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     active=db.scalar(select(func.count()).select_from(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)) or 0
+    global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
+    if s.global_workload_limit and global_active>=s.global_workload_limit:raise HTTPException(503,'Platform capacity reached. An administrator must raise GLOBAL_WORKLOAD_LIMIT or upgrade Railway.')
     if active>=quota(u):raise HTTPException(403,'Workload quota reached')
     if runtime not in {'python','node'} or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _.-]{1,79}',name):raise HTTPException(400,'Invalid configuration')
     try:filename=safe_filename(file.filename or 'upload');entrypoint=safe_filename(entrypoint)
@@ -239,6 +242,35 @@ def delete_schedule(wid:int,sid:int,request:Request,u:User=Depends(current),_=De
     if not row or row.workload_id!=wid:raise HTTPException(404)
     db.delete(row);audit(db,u,'schedule.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=schedules',303)
 
+@app.post('/servers/{wid}/deployments/{did}/rollback')
+async def rollback_deployment(wid:int,did:str,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=accessible_workload(wid,u,db,'control');deployments=await RailwayClient().deployments(w.railway_service_id)
+    if did not in {x['id'] for x in deployments}:raise HTTPException(404,'Deployment not found')
+    await RailwayClient().rollback(did);w.state=State.running;audit(db,u,'deployment.rollback',f'workload:{wid}',request.client.host if request.client else '',{'deployment_id':did});db.commit();return RedirectResponse(f'/servers/{wid}?tab=deployments',303)
+
+@app.get('/store',response_class=HTMLResponse)
+def store(request:Request,u:User=Depends(current)):
+    plans=[{'name':'Free','price':'₹0','slots':2,'features':['Telegram + web sync','Logs and controls','Manual backups']},{'name':'Premium','price':'Manual','slots':20,'features':['Schedules and variables','Collaborators','Priority support']},{'name':'Admin','price':'Private','slots':100,'features':['Platform operations','User management','Extended quotas']}]
+    return templates.TemplateResponse('store.html',ctx(request,u,plans=plans))
+@app.post('/store/request')
+def request_plan(request:Request,plan:str=Form(...),message:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if plan not in {'Premium','Admin'}:raise HTTPException(400,'Invalid plan')
+    db.add(SupportTicket(user_id=u.id,category='billing',subject=f'{plan} plan request',message=message[:2000] or f'Please review my {plan} upgrade request.'));audit(db,u,'plan.request','billing',request.client.host if request.client else '',{'plan':plan});db.commit();return RedirectResponse('/support',303)
+@app.get('/support',response_class=HTMLResponse)
+def support(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    tickets=db.scalars(select(SupportTicket).where(SupportTicket.user_id==u.id).order_by(SupportTicket.created_at.desc())).all();return templates.TemplateResponse('support.html',ctx(request,u,tickets=tickets))
+@app.post('/support')
+def create_ticket(request:Request,category:str=Form(...),subject:str=Form(...),message:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if category not in {'technical','billing','abuse','feature'} or not 3<=len(subject)<=120 or not 10<=len(message)<=5000:raise HTTPException(400,'Invalid ticket')
+    ticket=SupportTicket(user_id=u.id,category=category,subject=subject,message=message);db.add(ticket);db.flush();audit(db,u,'ticket.create',f'ticket:{ticket.id}',request.client.host if request.client else '');db.commit();return RedirectResponse('/support',303)
+@app.post('/admin/tickets/{tid}')
+def update_ticket(tid:int,request:Request,status:str=Form(...),admin_note:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
+    if status not in {'open','in_progress','resolved','closed'}:raise HTTPException(400)
+    ticket=db.get(SupportTicket,tid)
+    if not ticket:raise HTTPException(404)
+    ticket.status=status;ticket.admin_note=admin_note[:5000];db.add(Notification(user_id=ticket.user_id,title=f'Ticket #{ticket.id} updated',message=f'Status: {status}. {admin_note[:300]}'));audit(db,u,'ticket.update',f'ticket:{tid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin#tickets',303)
+
 @app.get('/internal/artifacts/{wid}')
 def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
     token=request.headers.get('Authorization','').removeprefix('Bearer ');rt=db.scalar(select(RunnerToken).where(RunnerToken.workload_id==wid,RunnerToken.token_hash==hash_token(token))) if token else None;now=datetime.now(timezone.utc)
@@ -252,7 +284,8 @@ async def telegram(secret:str,request:Request):
 @app.get('/admin',response_class=HTMLResponse)
 def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
-    users=db.scalars(select(User).order_by(User.created_at.desc()).limit(200)).all();audits=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(200)).all();return templates.TemplateResponse('admin.html',ctx(request,u,users=users,audits=audits))
+    users=db.scalars(select(User).order_by(User.created_at.desc()).limit(200)).all();audits=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(200)).all();tickets=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(100)).all();workload_count=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
+    return templates.TemplateResponse('admin.html',ctx(request,u,users=users,audits=audits,tickets=tickets,workload_count=workload_count,global_limit=s.global_workload_limit))
 @app.post('/admin/users/{uid}')
 def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(False),quota_value:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role!=Role.owner:raise HTTPException(403)

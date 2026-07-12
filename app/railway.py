@@ -21,6 +21,7 @@ class RailwayClient:
     async def redeploy(self,sid):
         return await self.gql('mutation($s:String!,$e:String!){serviceInstanceRedeploy(serviceId:$s,environmentId:$e)}',{'s':sid,'e':self.s.railway_environment_id})
     async def delete(self,sid):return await self.gql('mutation($id:String!){serviceDelete(id:$id)}',{'id':sid})
+    async def rollback(self,deployment_id):return await self.gql('mutation($id:String!){deploymentRollback(id:$id){id}}',{'id':deployment_id})
     async def deployments(self,sid):
         q='query($input:DeploymentListInput!){deployments(first:10,input:$input){edges{node{id status createdAt}}}}'
         d=await self.gql(q,{'input':{'projectId':self.s.railway_project_id,'environmentId':self.s.railway_environment_id,'serviceId':sid}});return [e['node'] for e in d['deployments']['edges']]

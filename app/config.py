@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     telegram_webhook_secret: str = 'change-me'
     owner_ids: str = ''
     max_upload_mb: int = Field(10, ge=1, le=50)
+    global_workload_limit: int = Field(3, ge=0, le=1000)
     session_ttl_seconds: int = Field(86400, ge=300, le=2592000)
     railway_api_token: str = ''
     railway_project_id: str = ''

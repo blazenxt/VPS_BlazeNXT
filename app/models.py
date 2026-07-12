@@ -67,3 +67,9 @@ class Notification(Base):
     __tablename__='notifications'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
     title:Mapped[str]=mapped_column(String(120)); message:Mapped[str]=mapped_column(Text); read:Mapped[bool]=mapped_column(Boolean,default=False); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class SupportTicket(Base):
+    __tablename__='support_tickets'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
+    category:Mapped[str]=mapped_column(String(30),default='technical'); subject:Mapped[str]=mapped_column(String(120)); message:Mapped[str]=mapped_column(Text); status:Mapped[str]=mapped_column(String(20),default='open',index=True)
+    admin_note:Mapped[str|None]=mapped_column(Text); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+    user:Mapped[User]=relationship()
