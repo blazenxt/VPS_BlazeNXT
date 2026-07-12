@@ -1,6 +1,7 @@
 import asyncio,hashlib,io,json,logging,re,secrets,time,zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timedelta,timezone
+from pathlib import PurePosixPath
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -49,7 +50,7 @@ async def lifespan(app):
     scheduler=asyncio.create_task(schedule_worker())
     yield
     scheduler.cancel()
-app=FastAPI(title='BlazeNXT Control Plane',version='5.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
+app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.middleware('http')
 async def security_headers(request,call_next):
@@ -145,6 +146,44 @@ def artifact_files(a:Artifact):
         with zipfile.ZipFile(io.BytesIO(a.data)) as z:
             return [{'name':x.filename,'size':x.file_size,'kind':'folder' if x.is_dir() else 'file'} for x in z.infolist()[:300]]
     except zipfile.BadZipFile:return []
+def clean_archive_path(raw:str)->str:
+    p=PurePosixPath(raw.replace('\\','/'))
+    if not raw or p.is_absolute() or '..' in p.parts or len(str(p))>240:raise HTTPException(400,'Unsafe file path')
+    return str(p)
+def read_artifact_text(a:Artifact,path:str)->str:
+    path=clean_archive_path(path)
+    try:
+        if a.filename.endswith('.zip'):
+            with zipfile.ZipFile(io.BytesIO(a.data)) as z:
+                info=z.getinfo(path)
+                if info.is_dir() or info.file_size>256*1024:raise HTTPException(400,'Only text files up to 256 KB can be edited')
+                raw=z.read(info)
+        else:
+            if path!=a.filename or a.size>256*1024:raise HTTPException(404)
+            raw=a.data
+        return raw.decode('utf-8')
+    except KeyError:raise HTTPException(404,'File not found')
+    except UnicodeDecodeError:raise HTTPException(400,'Binary files cannot be edited')
+def rebuild_artifact(a:Artifact,path:str,content:bytes|None,delete=False)->bytes:
+    path=clean_archive_path(path)
+    if not a.filename.endswith('.zip'):
+        if path!=a.filename or delete:raise HTTPException(400,'Single entrypoint files cannot be deleted')
+        return content or b''
+    source=io.BytesIO(a.data);target=io.BytesIO();found=False
+    with zipfile.ZipFile(source) as zin,zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename==path:
+                found=True
+                if delete:continue
+                zout.writestr(item,content or b'')
+            else:zout.writestr(item,zin.read(item.filename) if not item.is_dir() else b'')
+        if not found and not delete:zout.writestr(path,content or b'')
+    if delete and not found:raise HTTPException(404,'File not found')
+    data=target.getvalue();inspect_zip(data);return data
+async def apply_artifact_update(db,w,u,ip,data,event,detail=None):
+    old=w.artifact;db.add(Backup(workload_id=w.id,name=f'Automatic backup before {event}',filename=old.filename,sha256=old.sha256,size=old.size,data=old.data))
+    new=Artifact(owner_id=w.user_id,filename=old.filename,content_type=old.content_type,sha256=hashlib.sha256(data).hexdigest(),size=len(data),data=data);db.add(new);db.flush();w.artifact_id=new.id;audit(db,u,event,f'workload:{w.id}',ip,detail or {'sha256':new.sha256});db.commit()
+    if w.railway_service_id:await refresh_artifact(db,w)
 
 @app.get('/servers/{wid}',response_class=HTMLResponse)
 async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends(current),db:Session=Depends(get_db)):
@@ -164,6 +203,38 @@ async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends
 def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
     w=owned_workload(wid,u,db);name=re.sub(r'[^A-Za-z0-9_.-]','_',w.artifact.filename)
     return Response(w.artifact.data,media_type=w.artifact.content_type,headers={'Content-Disposition':f'attachment; filename="{name}"','X-Content-Type-Options':'nosniff'})
+
+@app.get('/servers/{wid}/files/edit',response_class=HTMLResponse)
+def edit_file_page(wid:int,path:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    w=accessible_workload(wid,u,db,'files');content=read_artifact_text(w.artifact,path);is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
+    return templates.TemplateResponse('file_editor.html',ctx(request,u,w=w,path=clean_archive_path(path),content=content,is_owner=is_owner))
+@app.post('/servers/{wid}/files/save')
+async def save_artifact_file(wid:int,request:Request,path:str=Form(...),content:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);raw=content.encode()
+    if len(raw)>256*1024:raise HTTPException(413,'Editor limit is 256 KB')
+    path=clean_archive_path(path);data=rebuild_artifact(w.artifact,path,raw);await apply_artifact_update(db,w,u,request.client.host if request.client else '',data,'file.save',{'path':path});return RedirectResponse(f'/servers/{wid}?tab=files',303)
+@app.post('/servers/{wid}/files/delete')
+async def delete_artifact_file(wid:int,request:Request,path:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);path=clean_archive_path(path)
+    if path==w.entrypoint:raise HTTPException(400,'Entrypoint cannot be deleted')
+    data=rebuild_artifact(w.artifact,path,None,delete=True);await apply_artifact_update(db,w,u,request.client.host if request.client else '',data,'file.delete',{'path':path});return RedirectResponse(f'/servers/{wid}?tab=files',303)
+@app.post('/servers/{wid}/backups/{bid}/restore')
+async def restore_backup(wid:int,bid:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);backup=db.get(Backup,bid)
+    if not backup or backup.workload_id!=wid:raise HTTPException(404)
+    old=w.artifact;db.add(Backup(workload_id=wid,name='Automatic pre-restore backup',filename=old.filename,sha256=old.sha256,size=old.size,data=old.data));a=Artifact(owner_id=w.user_id,filename=backup.filename,content_type='application/octet-stream',sha256=backup.sha256,size=backup.size,data=backup.data);db.add(a);db.flush();w.artifact_id=a.id;audit(db,u,'backup.restore',f'workload:{wid}',request.client.host if request.client else '',{'backup_id':bid});db.commit()
+    if w.railway_service_id:await refresh_artifact(db,w)
+    return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+@app.post('/servers/{wid}/rename')
+def rename_workload(wid:int,request:Request,name:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _.-]{1,79}',name):raise HTTPException(400,'Invalid name')
+    old=w.name;w.name=name;audit(db,u,'workload.rename',f'workload:{wid}',request.client.host if request.client else '',{'old':old,'new':name});db.commit();return RedirectResponse(f'/servers/{wid}?tab=settings',303)
+@app.post('/servers/{wid}/reinstall')
+async def reinstall_workload(wid:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    if not w.railway_service_id:raise HTTPException(400,'Service is not provisioned')
+    await refresh_artifact(db,w);audit(db,u,'workload.reinstall',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}',303)
 
 @app.get('/api/workloads/{wid}/status')
 async def workload_status(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):

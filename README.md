@@ -1,4 +1,6 @@
-# BlazeNXT Control Plane v5
+# BlazeNXT Control Plane v1
+
+**Public release line: v1.x.** Internal development iterations do not change the public major version.
 
 Railway-native Telegram bot hosting with a FastAPI website/control plane. Uploaded code is never executed by the website: each workload is provisioned as a separate Railway service using a non-root runner image.
 
@@ -13,7 +15,9 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Telegram file uploads, server lists, account/platform status, logs, backups and start/stop/restart controls
 - Bidirectional action notifications between web controls and Telegram
 - Separate Railway service per workload with auto-refreshing runtime logs
-- Artifact file explorer, secure downloads, package replacement and automatic pre-deploy backup
+- Artifact file explorer, UTF-8 editor, file creation/deletion, secure downloads and package replacement
+- Automatic pre-change backups, downloadable snapshots and one-click backup restore
+- Server rename, current-artifact reinstall and automatic isolated-service redeployment
 - Encrypted environment variables synchronized to Railway and masked in the panel
 - Manual artifact backups, lifecycle schedules and permission-based server collaborators
 - Startup/isolation details, notifications and unified web/bot/scheduler activity timeline
@@ -61,4 +65,4 @@ docker compose up --build
 - Pin the runner image by digest and add a malware-scanning service before public registration.
 - Review audit logs and automatically expire dormant workloads.
 
-The original monolithic bot is retained under `legacy/` for reference and is not run by v2.
+The original monolithic bot is retained under `legacy/` for reference and is not run by BlazeNXT v1.
