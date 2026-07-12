@@ -8,6 +8,7 @@ from app.models import Artifact,Backup,Role,State,User,Workload
 from app.railway import RailwayClient
 from app.security import inspect_zip,safe_filename
 from app.services import audit,perform_action,provision,quota
+from app.webhooks import dispatch_event
 s=get_settings()
 async def api(method,payload=None):
     if not s.bot_token:return None
@@ -84,7 +85,7 @@ async def handle_update(update):
                 if data.startswith('act:'):
                     _,action,wid=data.split(':');w=db.get(Workload,int(wid))
                     if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
-                    await perform_action(db,w,action);audit(db,u,f'workload.{action}.telegram',f'workload:{w.id}','telegram');db.commit();await edit(chat,mid,detail_text(w),detail_keyboard(w));return
+                    await perform_action(db,w,action);audit(db,u,f'workload.{action}.telegram',f'workload:{w.id}','telegram');db.commit();await dispatch_event(w.id,f'workload.{action}',{'source':'telegram'});await edit(chat,mid,detail_text(w),detail_keyboard(w));return
                 if data.startswith('log:'):
                     w=db.get(Workload,int(data.split(':')[1]))
                     if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')

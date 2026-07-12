@@ -76,6 +76,21 @@ class AuthIdentity(Base):
 class AuthTokenUse(Base):
     __tablename__='auth_token_uses'
     id:Mapped[int]=mapped_column(primary_key=True); token_hash:Mapped[str]=mapped_column(String(64),unique=True,index=True); used_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class ApiKey(Base):
+    __tablename__='api_keys'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
+    name:Mapped[str]=mapped_column(String(80)); prefix:Mapped[str]=mapped_column(String(16),index=True); key_hash:Mapped[str]=mapped_column(String(64),unique=True,index=True); scopes:Mapped[str]=mapped_column(Text,default='["servers:read"]'); revoked:Mapped[bool]=mapped_column(Boolean,default=False)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); last_used_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
+class WorkloadWebhook(Base):
+    __tablename__='workload_webhooks'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True)
+    url:Mapped[str]=mapped_column(Text); encrypted_secret:Mapped[str]=mapped_column(Text); events:Mapped[str]=mapped_column(Text,default='["*"]'); enabled:Mapped[bool]=mapped_column(Boolean,default=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class WebhookDelivery(Base):
+    __tablename__='webhook_deliveries'
+    id:Mapped[int]=mapped_column(primary_key=True); webhook_id:Mapped[int]=mapped_column(ForeignKey('workload_webhooks.id',ondelete='CASCADE'),index=True); event:Mapped[str]=mapped_column(String(80)); status_code:Mapped[int|None]=mapped_column(Integer); success:Mapped[bool]=mapped_column(Boolean,default=False); error:Mapped[str|None]=mapped_column(Text); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class UserSecurity(Base):
+    __tablename__='user_security'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); encrypted_totp_secret:Mapped[str]=mapped_column(Text); enabled:Mapped[bool]=mapped_column(Boolean,default=False); encrypted_recovery_codes:Mapped[str]=mapped_column(Text); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

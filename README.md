@@ -22,7 +22,11 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Server rename, current-artifact reinstall and automatic isolated-service redeployment
 - Encrypted environment variables synchronized to Railway and masked in the panel
 - Manual artifact backups, lifecycle schedules and permission-based server collaborators
-- Startup/isolation details, notifications and unified web/bot/scheduler activity timeline
+- Pterodactyl-style application templates/eggs and editable startup configuration
+- Scoped API keys with authenticated `/api/v1` server and power endpoints
+- HMAC-SHA256 outbound webhooks, SSRF destination checks and delivery history
+- TOTP two-factor authentication with encrypted one-use recovery codes
+- Startup/isolation details, notifications and unified web/bot/API/webhook/scheduler activity timeline
 - User/premium/admin/owner roles, quotas and upgraded admin controls
 - Railway deployment history with validated rollback controls
 - KataBump-style plan catalog, manual upgrade ordering and synchronized support tickets
@@ -49,6 +53,17 @@ Railway does not support safe Docker-in-Docker in a normal app service. Isolatio
 10. Confirm `/health/ready` returns ready and check the deployment log for `Telegram bot ... started with webhook sync` before enabling users.
 
 Without Railway variables, the dashboard works but deployments safely enter `failed` with a provider-not-configured error.
+
+## API v1
+
+Create a scoped key under **Login & Security**, then use:
+
+```bash
+curl -H "Authorization: Bearer $BLAZENXT_API_KEY" https://hosting.blazenxt.in/api/v1/servers
+curl -X POST -H "Authorization: Bearer $BLAZENXT_API_KEY" https://hosting.blazenxt.in/api/v1/servers/1/power/restart
+```
+
+Webhook deliveries include `X-BlazeNXT-Event` and `X-BlazeNXT-Signature-256: sha256=<hmac>` headers. Database provisioning remains disabled by default because each database consumes another Railway service.
 
 ## Local
 

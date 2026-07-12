@@ -9,13 +9,16 @@ from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST,Counter,generate_latest
 from sqlalchemy import func,select
 from sqlalchemy.orm import Session
-from app.auth import providers as auth_providers,router as auth_router
+from app.api_v1 import router as api_v1_router
+from app.auth import login_response,providers as auth_providers,router as auth_router
+from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Artifact,AuditLog,AuthIdentity,Backup,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,Workload,WorkloadMember,WorkloadVariable
+from app.models import ApiKey,Artifact,AuditLog,AuthIdentity,Backup,Notification,Role,RunnerToken,Schedule,State,SupportTicket,User,WebhookDelivery,Workload,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
+from app.webhooks import dispatch_event,validate_webhook_url
 s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None}
 async def configure_telegram_webhook():
     import httpx
@@ -51,7 +54,7 @@ async def lifespan(app):
     scheduler=asyncio.create_task(schedule_worker())
     yield
     scheduler.cancel()
-app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router)
+app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router);app.include_router(api_v1_router)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.middleware('http')
 async def security_headers(request,call_next):
@@ -88,7 +91,7 @@ def auth(request:Request,db:Session=Depends(get_db)):
     else:u.username=data.get('username');u.display_name=name;u.role=Role.owner if tid in s.owners else u.role
     db.flush();identity=db.scalar(select(AuthIdentity).where(AuthIdentity.provider=='telegram',AuthIdentity.subject==str(tid)))
     if not identity:db.add(AuthIdentity(user_id=u.id,provider='telegram',subject=str(tid),display_name=name,avatar_url=data.get('photo_url')))
-    db.commit();db.refresh(u);audit(db,u,'login','web',request.client.host if request.client else '');db.commit();r=RedirectResponse('/dashboard',303);r.set_cookie('blaze_session',sign_session(u.id),httponly=True,secure=s.production,samesite='lax',max_age=s.session_ttl_seconds);return r
+    db.commit();db.refresh(u);audit(db,u,'login','web',request.client.host if request.client else '');db.commit();return login_response(u.id,db)
 @app.post('/logout')
 def logout(request:Request,u=Depends(current),_=Depends(csrf)):
     r=RedirectResponse('/',303);r.delete_cookie('blaze_session');return r
@@ -98,13 +101,14 @@ def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)
     ws=db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared_ids)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
     notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
     global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
-    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit))
+    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS))
 @app.post('/workloads')
-async def upload(request:Request,bg:BackgroundTasks,name:str=Form(...),runtime:str=Form(...),entrypoint:str=Form(...),file:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+async def upload(request:Request,bg:BackgroundTasks,name:str=Form(...),runtime:str=Form(...),entrypoint:str=Form(...),preset:str=Form('custom'),file:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     active=db.scalar(select(func.count()).select_from(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)) or 0
     global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
     if s.global_workload_limit and global_active>=s.global_workload_limit:raise HTTPException(503,'Platform capacity reached. An administrator must raise GLOBAL_WORKLOAD_LIMIT or upgrade Railway.')
     if active>=quota(u):raise HTTPException(403,'Workload quota reached')
+    if preset in PRESETS:runtime=PRESETS[preset]['runtime'];entrypoint=PRESETS[preset]['entrypoint']
     if runtime not in {'python','node'} or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 _.-]{1,79}',name):raise HTTPException(400,'Invalid configuration')
     try:filename=safe_filename(file.filename or 'upload');entrypoint=safe_filename(entrypoint)
     except ValueError as e:raise HTTPException(400,str(e))
@@ -129,6 +133,7 @@ async def action(wid:int,action:str,request:Request,u:User=Depends(current),_=De
             from app.telegram_bot import send_user_notification
             await send_user_notification(w.user_id,f'🔄 <b>{w.name}</b>: {action} completed from web panel.')
         except Exception:pass
+        await dispatch_event(wid,f'workload.{action}',{'source':'web','state':w.state.value})
     except Exception as e:w.last_error=str(e)[:1000];db.commit();raise HTTPException(502,str(e))
     return RedirectResponse(f'/servers/{wid}',303)
 @app.get('/api/workloads/{wid}/logs')
@@ -205,8 +210,9 @@ async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends
     backups=db.scalars(select(Backup).where(Backup.workload_id==wid).order_by(Backup.created_at.desc())).all()
     members=db.scalars(select(WorkloadMember).where(WorkloadMember.workload_id==wid)).all()
     schedules=db.scalars(select(Schedule).where(Schedule.workload_id==wid).order_by(Schedule.created_at.desc())).all()
+    webhooks=db.scalars(select(WorkloadWebhook).where(WorkloadWebhook.workload_id==wid).order_by(WorkloadWebhook.created_at.desc())).all();hook_ids=[x.id for x in webhooks];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hook_ids)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hook_ids else []
     is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
-    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner))
+    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning))
 
 @app.get('/servers/{wid}/download')
 def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
@@ -266,6 +272,17 @@ async def replace_artifact(wid:int,request:Request,file:UploadFile=File(...),ent
     a=Artifact(owner_id=w.user_id,filename=filename,content_type=file.content_type or 'application/octet-stream',sha256=hashlib.sha256(data).hexdigest(),size=len(data),data=data);db.add(a);db.flush();w.artifact_id=a.id;w.entrypoint=entrypoint;audit(db,u,'artifact.replace',f'workload:{wid}',request.client.host if request.client else '',{'sha256':a.sha256});db.commit()
     if w.railway_service_id:await refresh_artifact(db,w)
     return RedirectResponse(f'/servers/{wid}?tab=files',303)
+
+@app.post('/servers/{wid}/startup')
+async def update_startup(wid:int,request:Request,runtime:str=Form(...),entrypoint:str=Form(...),preset:str=Form('custom'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    if preset in PRESETS:runtime=PRESETS[preset]['runtime'];entrypoint=PRESETS[preset]['entrypoint']
+    if runtime not in {'python','node'}:raise HTTPException(400,'Invalid runtime')
+    try:entrypoint=safe_filename(entrypoint)
+    except ValueError as e:raise HTTPException(400,str(e))
+    w.runtime=runtime;w.entrypoint=entrypoint;audit(db,u,'startup.update',f'workload:{wid}',request.client.host if request.client else '',{'runtime':runtime,'entrypoint':entrypoint,'preset':preset});db.commit()
+    if w.railway_service_id:await refresh_artifact(db,w)
+    await dispatch_event(wid,'startup.updated',{'runtime':runtime,'entrypoint':entrypoint});return RedirectResponse(f'/servers/{wid}?tab=startup',303)
 
 @app.post('/servers/{wid}/variables')
 async def add_variable(wid:int,request:Request,name:str=Form(...),value:str=Form(...),secret:bool=Form(False),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
@@ -327,6 +344,21 @@ def delete_schedule(wid:int,sid:int,request:Request,u:User=Depends(current),_=De
     owned_workload(wid,u,db);row=db.get(Schedule,sid)
     if not row or row.workload_id!=wid:raise HTTPException(404)
     db.delete(row);audit(db,u,'schedule.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=schedules',303)
+
+@app.post('/servers/{wid}/webhooks')
+def add_webhook(wid:int,request:Request,url:str=Form(...),secret_value:str=Form(...),events:str=Form('*'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db)
+    try:url=validate_webhook_url(url.strip())
+    except ValueError as e:raise HTTPException(400,str(e))
+    if len(secret_value)<16:raise HTTPException(400,'Webhook secret must be at least 16 characters')
+    allowed={'*','workload.start','workload.stop','workload.restart','deployment.completed','deployment.failed','startup.updated'};chosen=[x.strip() for x in events.split(',') if x.strip() in allowed]
+    if not chosen:raise HTTPException(400,'No valid events selected')
+    db.add(WorkloadWebhook(workload_id=wid,url=url,encrypted_secret=encrypt_secret(secret_value),events=json.dumps(chosen)));audit(db,u,'webhook.create',f'workload:{wid}',request.client.host if request.client else '',{'url':url,'events':chosen});db.commit();return RedirectResponse(f'/servers/{wid}?tab=webhooks',303)
+@app.post('/servers/{wid}/webhooks/{hook_id}/delete')
+def delete_webhook(wid:int,hook_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db);hook=db.get(WorkloadWebhook,hook_id)
+    if not hook or hook.workload_id!=wid:raise HTTPException(404)
+    db.delete(hook);audit(db,u,'webhook.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=webhooks',303)
 
 @app.post('/servers/{wid}/deployments/{did}/rollback')
 async def rollback_deployment(wid:int,did:str,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):

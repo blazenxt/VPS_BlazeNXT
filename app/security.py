@@ -3,7 +3,7 @@ from pathlib import PurePosixPath
 from cryptography.fernet import Fernet, InvalidToken
 from itsdangerous import BadSignature,SignatureExpired,URLSafeTimedSerializer
 from app.config import get_settings
-s=get_settings(); signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-session-v1');oauth_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-oauth-state-v1');magic_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-magic-link-v1'); SAFE=re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$')
+s=get_settings(); signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-session-v1');oauth_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-oauth-state-v1');magic_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-magic-link-v1');preauth_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-preauth-v1'); SAFE=re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$')
 def sign_session(uid): return signer.dumps({'uid':uid,'csrf':secrets.token_urlsafe(24)})
 def read_session(v):
     try:return signer.loads(v,max_age=s.session_ttl_seconds)
@@ -16,6 +16,10 @@ def read_oauth_state(value,provider):
 def sign_magic_link(email,link_uid=None,bind=None):return magic_signer.dumps({'email':email.lower(),'uid':link_uid,'bind':bind,'nonce':secrets.token_urlsafe(16)})
 def read_magic_link(value):
     try:return magic_signer.loads(value,max_age=s.magic_link_ttl_seconds)
+    except (BadSignature,SignatureExpired):return None
+def sign_preauth(uid):return preauth_signer.dumps({'uid':uid,'nonce':secrets.token_urlsafe(16)})
+def read_preauth(value):
+    try:return preauth_signer.loads(value,max_age=300)
     except (BadSignature,SignatureExpired):return None
 def verify_telegram(data):
     supplied=data.get('hash',''); clean={k:str(v) for k,v in data.items() if k!='hash' and v is not None}

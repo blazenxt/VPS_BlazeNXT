@@ -23,6 +23,10 @@ async def provision(db,w):
         w.state=State.failed;w.last_error=str(e)[:1000];notify(db,w.user_id,'Deployment failed',f'{w.name}: {w.last_error}')
     db.commit()
     try:
+        from app.webhooks import dispatch_event
+        await dispatch_event(w.id,'deployment.completed' if w.state==State.running else 'deployment.failed',{'state':w.state.value,'error':w.last_error})
+    except Exception:pass
+    try:
         from app.telegram_bot import send_user_notification
         await send_user_notification(w.user_id,f"{'✅' if w.state==State.running else '❌'} <b>{w.name}</b> is now <b>{w.state.value}</b>.")
     except Exception:pass
