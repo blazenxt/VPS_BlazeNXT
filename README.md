@@ -42,6 +42,9 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Managed per-workload PostgreSQL services with persistent Railway volumes and private `DATABASE_URL` injection
 - Suspend/unsuspend operations and retained-volume destructive-action safeguards
 - Public aggregate status page, health snapshots, incident history and maintenance announcements
+- Secure iframe embedding with independent `FRAME_ANCESTORS` and `FRAME_SOURCES` HTTPS allowlists
+- Responsive embedded-tools workspace with sandboxing and external-open fallback
+- Dedicated admin pages for users, tickets, announcements, incidents, operations and audit
 - Notification center with web/Telegram broadcasts and dashboard notices
 - Customer portal with onboarding, referral credits, plan history, API usage and recent sign-ins
 - Admin emergency deployment switch, incident controls and CSV audit export
@@ -67,6 +70,18 @@ Railway does not support safe Docker-in-Docker in a normal app service. Isolatio
 10. Confirm `/health/ready` returns ready and check the deployment log for `Telegram bot ... started with webhook sync` before enabling users.
 
 Without Railway variables, the dashboard works but deployments safely enter `failed` with a provider-not-configured error.
+
+## Iframe configuration
+
+Defaults block third-party embedding of BlazeNXT while allowing Telegram OAuth frames. To embed BlazeNXT only on trusted parents and expose trusted tools inside the panel:
+
+```env
+FRAME_ANCESTORS=https://portal.example.com,https://admin.example.com
+FRAME_SOURCES=https://oauth.telegram.org,https://grafana.example.com
+EMBED_TOOLS_JSON=[{"name":"Grafana","url":"https://grafana.example.com/"}]
+```
+
+Only exact HTTPS origins are accepted. Wildcards, credentials in URLs, paths in origin allowlists, and insecure HTTP origins are rejected. External tools are rendered in sandboxed iframes. Keep `FRAME_ANCESTORS='none'` when parent embedding is not required.
 
 ## API v1
 

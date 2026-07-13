@@ -2,6 +2,7 @@ import asyncio,csv,hashlib,io,json,logging,re,secrets,time,zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timedelta,timezone
 from pathlib import PurePosixPath
+from urllib.parse import urlparse
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,12 +62,28 @@ async def lifespan(app):
     scheduler.cancel()
 app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router);app.include_router(api_v1_router)
 app.mount('/static',StaticFiles(directory='static'),name='static')
+def safe_frame_origins(raw,allow_none=False):
+    values=[]
+    for item in raw.split(','):
+        item=item.strip()
+        if item in {"'self'",'self'}:values.append("'self'");continue
+        if allow_none and item in {"'none'",'none'}:values.append("'none'");continue
+        parsed=urlparse(item)
+        if parsed.scheme=='https' and parsed.hostname and not parsed.username and not parsed.password and parsed.path in ('','/') and not parsed.query and not parsed.fragment:values.append(f'https://{parsed.netloc}')
+    if allow_none and "'none'" in values:return ["'none'"]
+    return list(dict.fromkeys(values))
+FRAME_ANCESTORS=safe_frame_origins(s.frame_ancestors,True) or ["'none'"]
+FRAME_SOURCES=safe_frame_origins(s.frame_sources) or ['https://oauth.telegram.org']
 @app.middleware('http')
 async def security_headers(request,call_next):
     ip=request.client.host if request.client else 'unknown';key=f'{ip}:{request.url.path}';now=time.time();hits=[x for x in rate.get(key,[]) if now-x<60];limit=20 if request.url.path.startswith(('/auth','/api')) else 120
     if len(hits)>=limit:return JSONResponse({'detail':'rate limit exceeded'},429)
     hits.append(now);rate[key]=hits;response=await call_next(request)
-    response.headers.update({'X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'strict-origin-when-cross-origin','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':"default-src 'self'; img-src 'self' data: https://t.me; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; frame-src https://oauth.telegram.org",'Strict-Transport-Security':'max-age=31536000; includeSubDomains'})
+    csp="default-src 'self'; img-src 'self' data: https://t.me; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; frame-src 'self' "+' '.join(FRAME_SOURCES)+"; frame-ancestors "+' '.join(FRAME_ANCESTORS)
+    headers={'X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':csp,'Strict-Transport-Security':'max-age=31536000; includeSubDomains'}
+    if FRAME_ANCESTORS==["'none'"]:headers['X-Frame-Options']='DENY'
+    elif FRAME_ANCESTORS==["'self'"]:headers['X-Frame-Options']='SAMEORIGIN'
+    response.headers.update(headers)
     REQ.labels(request.method,request.url.path,response.status_code).inc();return response
 def current(request:Request,db:Session=Depends(get_db)):
     p=read_session(request.cookies.get('blaze_session',''))
@@ -118,6 +135,18 @@ def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)
     notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
     global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;visible_ids=[w.id for w in ws];allocations=db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(visible_ids))).all() if visible_ids else [];container_count=sum(x.replicas for x in allocations)+(len(ws)-len(allocations))
     return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,container_count=container_count,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS))
+def configured_embed_tools():
+    try:items=json.loads(s.embed_tools_json)
+    except json.JSONDecodeError:return []
+    tools=[]
+    for item in items if isinstance(items,list) else []:
+        if not isinstance(item,dict):continue
+        parsed=urlparse(str(item.get('url','')));origin=f'{parsed.scheme}://{parsed.netloc}'
+        if parsed.scheme=='https' and parsed.hostname and origin in FRAME_SOURCES:tools.append({'name':str(item.get('name','Embedded tool'))[:80],'url':str(item['url'])})
+    return tools
+@app.get('/tools',response_class=HTMLResponse)
+def embedded_tools(request:Request,u:User=Depends(current)):
+    return templates.TemplateResponse('tools.html',ctx(request,u,tools=configured_embed_tools()))
 def visible_workloads(db,u,scope='mine'):
     if scope=='all' and u.role in {Role.admin,Role.owner}:return db.scalars(select(Workload).where(Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
     shared=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all();return db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
@@ -516,7 +545,7 @@ def update_ticket(tid:int,request:Request,status:str=Form(...),admin_note:str=Fo
     if status not in {'open','in_progress','resolved','closed'}:raise HTTPException(400)
     ticket=db.get(SupportTicket,tid)
     if not ticket:raise HTTPException(404)
-    ticket.status=status;ticket.admin_note=admin_note[:5000];db.add(Notification(user_id=ticket.user_id,title=f'Ticket #{ticket.id} updated',message=f'Status: {status}. {admin_note[:300]}'));audit(db,u,'ticket.update',f'ticket:{tid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin#tickets',303)
+    ticket.status=status;ticket.admin_note=admin_note[:5000];db.add(Notification(user_id=ticket.user_id,title=f'Ticket #{ticket.id} updated',message=f'Status: {status}. {admin_note[:300]}'));audit(db,u,'ticket.update',f'ticket:{tid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin/tickets',303)
 
 @app.get('/internal/artifacts/{wid}')
 def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
@@ -555,7 +584,7 @@ def redeem_referral(request:Request,code:str=Form(...),u:User=Depends(current),_
 @app.post('/admin/platform-switch')
 def platform_switch(request:Request,enabled:bool=Form(False),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role!=Role.owner:raise HTTPException(403)
-    row=db.get(PlatformSetting,'deployments_enabled') or PlatformSetting(key='deployments_enabled',value='true');db.add(row);row.value='true' if enabled else 'false';audit(db,u,'platform.switch','platform',request.client.host if request.client else '',{'enabled':enabled});db.commit();return RedirectResponse('/admin',303)
+    row=db.get(PlatformSetting,'deployments_enabled') or PlatformSetting(key='deployments_enabled',value='true');db.add(row);row.value='true' if enabled else 'false';audit(db,u,'platform.switch','platform',request.client.host if request.client else '',{'enabled':enabled});db.commit();return RedirectResponse('/admin/operations',303)
 @app.post('/admin/announcements')
 async def create_announcement(request:Request,title:str=Form(...),message:str=Form(...),level:str=Form('info'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
@@ -565,17 +594,17 @@ async def create_announcement(request:Request,title:str=Form(...),message:str=Fo
     audit(db,u,'announcement.create','platform',request.client.host if request.client else '',{'level':level});db.commit()
     from app.telegram_bot import send_user_notification
     await asyncio.gather(*(send_user_notification(target.id,f'📢 <b>{item.title}</b>\n{item.message[:1000]}') for target in users[:25]),return_exceptions=True)
-    return RedirectResponse('/admin',303)
+    return RedirectResponse('/admin/announcements',303)
 @app.post('/admin/incidents')
 def create_incident(request:Request,title:str=Form(...),message:str=Form(...),impact:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner} or impact not in {'minor','major','critical'}:raise HTTPException(403)
-    db.add(Incident(title=title[:160],message=message[:5000],impact=impact,created_by=u.id));audit(db,u,'incident.create','platform',request.client.host if request.client else '',{'impact':impact});db.commit();return RedirectResponse('/admin',303)
+    db.add(Incident(title=title[:160],message=message[:5000],impact=impact,created_by=u.id));audit(db,u,'incident.create','platform',request.client.host if request.client else '',{'impact':impact});db.commit();return RedirectResponse('/admin/incidents',303)
 @app.post('/admin/incidents/{incident_id}/resolve')
 def resolve_incident(incident_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
     row=db.get(Incident,incident_id)
     if not row:raise HTTPException(404)
-    row.status='resolved';row.resolved_at=datetime.now(timezone.utc);db.commit();return RedirectResponse('/admin',303)
+    row.status='resolved';row.resolved_at=datetime.now(timezone.utc);db.commit();return RedirectResponse('/admin/incidents',303)
 @app.get('/admin/audit.csv')
 def audit_export(u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
@@ -585,8 +614,20 @@ def audit_export(u:User=Depends(current),db:Session=Depends(get_db)):
 @app.get('/admin',response_class=HTMLResponse)
 def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
-    users=db.scalars(select(User).order_by(User.created_at.desc()).limit(200)).all();audits=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(200)).all();tickets=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(100)).all();incidents=db.scalars(select(Incident).order_by(Incident.created_at.desc()).limit(50)).all();announcements=db.scalars(select(Announcement).order_by(Announcement.created_at.desc()).limit(50)).all();workload_count=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
-    return templates.TemplateResponse('admin.html',ctx(request,u,users=users,audits=audits,tickets=tickets,incidents=incidents,announcements=announcements,deployments_enabled=deployments_enabled(db),workload_count=workload_count,global_limit=s.global_workload_limit))
+    stats={'users':db.scalar(select(func.count()).select_from(User)) or 0,'workloads':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'tickets':db.scalar(select(func.count()).select_from(SupportTicket).where(SupportTicket.status.in_(['open','in_progress']))) or 0,'incidents':db.scalar(select(func.count()).select_from(Incident).where(Incident.status!='resolved')) or 0};recent=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(20)).all()
+    return templates.TemplateResponse('admin_overview.html',ctx(request,u,stats=stats,recent=recent,deployments_enabled=deployments_enabled(db)))
+@app.get('/admin/{section}',response_class=HTMLResponse)
+def admin_section(section:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
+    allowed={'users','tickets','announcements','incidents','audit','operations'}
+    if section not in allowed:raise HTTPException(404)
+    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit}
+    if section=='users':data['users']=db.scalars(select(User).order_by(User.created_at.desc()).limit(500)).all()
+    elif section=='tickets':data['tickets']=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(300)).all()
+    elif section=='announcements':data['announcements']=db.scalars(select(Announcement).order_by(Announcement.created_at.desc()).limit(200)).all()
+    elif section=='incidents':data['incidents']=db.scalars(select(Incident).order_by(Incident.created_at.desc()).limit(200)).all()
+    elif section=='audit':data['audits']=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(500)).all()
+    return templates.TemplateResponse('admin_section.html',ctx(request,u,**data))
 @app.post('/admin/users/{uid}')
 def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(False),quota_value:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role!=Role.owner:raise HTTPException(403)
@@ -594,7 +635,7 @@ def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(Fals
     if not t:raise HTTPException(404)
     old_role=t.role;t.role=Role(role);t.banned=banned;t.quota=int(quota_value) if quota_value.strip() else None
     if old_role!=t.role:db.add(PlanEvent(user_id=t.id,old_plan=old_role.value,new_plan=t.role.value,changed_by=u.id));db.add(Notification(user_id=t.id,title='Plan updated',message=f'Your plan changed from {old_role.value} to {t.role.value}.'))
-    audit(db,u,'user.update',f'user:{uid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin',303)
+    audit(db,u,'user.update',f'user:{uid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin/users',303)
 @app.get('/health/live')
 def live():return {'status':'ok'}
 @app.get('/health/ready')

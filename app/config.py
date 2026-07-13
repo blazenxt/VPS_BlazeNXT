@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     smtp_from: str = ''
     smtp_starttls: bool = True
     magic_link_ttl_seconds: int = Field(900, ge=300, le=3600)
+    # Comma-separated HTTPS origins. Defaults preserve anti-clickjacking.
+    frame_ancestors: str = "'none'"
+    frame_sources: str = "https://oauth.telegram.org"
+    # JSON list: [{"name":"Tool","url":"https://trusted.example/"}]
+    embed_tools_json: str = "[]"
     owner_ids: str = ''
     max_upload_mb: int = Field(10, ge=1, le=50)
     global_workload_limit: int = Field(0, ge=0, le=10000)
