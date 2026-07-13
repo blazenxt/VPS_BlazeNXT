@@ -16,7 +16,7 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,User,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
@@ -68,6 +68,9 @@ async def schedule_worker():
                     db.commit()
                 cutoff=now-timedelta(days=7)
                 for update in db.scalars(select(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at<cutoff).limit(500)).all():db.delete(update)
+                for draft in db.scalars(select(TelegramUploadDraft).where(TelegramUploadDraft.status=='pending',TelegramUploadDraft.expires_at<now).limit(100)).all():
+                    artifact=draft.artifact;db.delete(draft);db.flush();db.delete(artifact)
+                for draft in db.scalars(select(TelegramUploadDraft).where(TelegramUploadDraft.status=='deployed',TelegramUploadDraft.created_at<cutoff).limit(500)).all():db.delete(draft)
                 db.commit()
         except Exception:logger.exception('Schedule worker failed')
 @asynccontextmanager

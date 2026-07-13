@@ -29,8 +29,8 @@ async def provision(db,w):
         await dispatch_event(w.id,'deployment.completed' if w.state==State.running else 'deployment.failed',{'state':w.state.value,'error':w.last_error})
     except Exception:pass
     try:
-        from app.telegram_bot import send_user_notification
-        await send_user_notification(w.user_id,f"{'✅' if w.state==State.running else '❌'} <b>{w.name}</b> is now <b>{w.state.value}</b>.")
+        from app.telegram_bot import send_workload_notification
+        await send_workload_notification(w.id,f"{'✅' if w.state==State.running else '❌'} <b>{w.name}</b> is now <b>{w.state.value}</b>.")
     except Exception:pass
 async def refresh_artifact(db,w):
     raw=issue_runner_token(db,w);db.commit();variables={'CONTROL_PLANE_URL':s.web_base_url.rstrip('/'),'RUNNER_TOKEN':raw,'WORKLOAD_ID':str(w.id),'ENTRYPOINT':w.entrypoint,'RUNTIME':w.runtime,**workload_variables(db,w.id)}

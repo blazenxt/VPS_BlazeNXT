@@ -134,6 +134,10 @@ class ApiRequestLog(Base):
 class ProcessedTelegramUpdate(Base):
     __tablename__='processed_telegram_updates'
     id:Mapped[int]=mapped_column(primary_key=True); update_id:Mapped[int]=mapped_column(BigInteger,unique=True,index=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class TelegramUploadDraft(Base):
+    __tablename__='telegram_upload_drafts'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); artifact_id:Mapped[int]=mapped_column(ForeignKey('artifacts.id',ondelete='CASCADE')); name:Mapped[str]=mapped_column(String(80)); runtime:Mapped[str]=mapped_column(String(16)); entrypoint:Mapped[str]=mapped_column(String(160)); status:Mapped[str]=mapped_column(String(20),default='pending',index=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); expires_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),index=True)
+    artifact:Mapped[Artifact]=relationship()
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

@@ -28,6 +28,8 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Three-minute runtime monitoring, webhook mismatch auto-repair and duplicate-update protection
 - Fast webhook acknowledgements with asynchronous processing and seven-day dedupe cleanup
 - Shared-workload permissions synchronized across web and Telegram controls
+- Persistent Telegram upload drafts with ZIP validation and smart Python/Node entrypoint detection
+- Telegram deployment preview, runtime selector, Deploy & Run, Cancel and 30-minute expiry cleanup
 - Telegram file uploads, server lists, account/platform status, logs, backups and start/stop/restart controls
 - Bidirectional action notifications between web controls and Telegram
 - Separate Railway service per workload with auto-refreshing runtime logs
