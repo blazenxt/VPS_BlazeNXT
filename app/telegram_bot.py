@@ -6,6 +6,7 @@ from sqlalchemy import func,select
 from app.config import get_settings
 from app.db import SessionLocal
 from app.models import Artifact,Backup,PlatformSetting,Role,State,TelegramUploadDraft,User,Workload,WorkloadMember
+from app.notifications import emit
 from app.railway import RailwayClient
 from app.security import inspect_zip,safe_filename
 from app.services import audit,perform_action,provision,quota
@@ -160,7 +161,7 @@ async def handle_update(update):
                     await edit(chat,mid,detail_text(w),detail_keyboard(w));return
                 if data.startswith('act:'):
                     _,action,wid=data.split(':');w=require_workload(db,u,wid,'control')
-                    await perform_action(db,w,action);audit(db,u,f'workload.{action}.telegram',f'workload:{w.id}','telegram');db.commit();await dispatch_event(w.id,f'workload.{action}',{'source':'telegram'});await edit(chat,mid,detail_text(w),detail_keyboard(w));return
+                    await perform_action(db,w,action);audit(db,u,f'workload.{action}.telegram',f'workload:{w.id}','telegram');emit(db,w.user_id,f'deployment.{action}',f'{w.name}: {action} completed',f'The {action} action completed from Telegram. Current state: {w.state.value}.',telegram=False);db.commit();await dispatch_event(w.id,f'workload.{action}',{'source':'telegram'});await edit(chat,mid,detail_text(w),detail_keyboard(w));return
                 if data.startswith('log:'):
                     w=require_workload(db,u,data.split(':')[1],'logs')
                     deployments=await RailwayClient().deployments(w.railway_service_id) if w.railway_service_id else [];logs=await RailwayClient().logs(deployments[0]['id']) if deployments else []

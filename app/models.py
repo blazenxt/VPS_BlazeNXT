@@ -67,6 +67,12 @@ class Notification(Base):
     __tablename__='notifications'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
     title:Mapped[str]=mapped_column(String(120)); message:Mapped[str]=mapped_column(Text); read:Mapped[bool]=mapped_column(Boolean,default=False); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class NotificationPreference(Base):
+    __tablename__='notification_preferences'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); web_enabled:Mapped[bool]=mapped_column(Boolean,default=True); email_enabled:Mapped[bool]=mapped_column(Boolean,default=True); telegram_enabled:Mapped[bool]=mapped_column(Boolean,default=True); event_categories:Mapped[str]=mapped_column(Text,default='["deployment","security","billing","support","incident"]'); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+class DeliveryOutbox(Base):
+    __tablename__='delivery_outbox'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); channel:Mapped[str]=mapped_column(String(20),index=True); event:Mapped[str]=mapped_column(String(80),index=True); title:Mapped[str]=mapped_column(String(160)); message:Mapped[str]=mapped_column(Text); status:Mapped[str]=mapped_column(String(20),default='pending',index=True); attempts:Mapped[int]=mapped_column(Integer,default=0); next_attempt:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); last_error:Mapped[str|None]=mapped_column(Text); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); sent_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
 class AuthIdentity(Base):
     __tablename__='auth_identities'; __table_args__=(UniqueConstraint('provider','subject'),)
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

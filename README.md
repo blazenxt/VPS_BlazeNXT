@@ -60,7 +60,9 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Secure iframe embedding with independent `FRAME_ANCESTORS` and `FRAME_SOURCES` HTTPS allowlists
 - Responsive embedded-tools workspace with sandboxing and external-open fallback
 - Dedicated admin pages for users, tickets, announcements, incidents, operations and audit
-- Notification center with web/Telegram broadcasts and dashboard notices
+- Unified notification center with per-user web/email/Telegram preferences and event categories
+- Persistent delivery outbox, HTML+text SMTP emails, Telegram delivery, five-attempt exponential retry and admin queue
+- Automated deployment, security, billing, support, referral, plan and incident notifications
 - Customer portal with onboarding, referral credits, plan history, API usage and recent sign-ins
 - Admin emergency deployment switch, incident controls and CSV audit export
 - Admin support queue, user notifications, audit trail, health/readiness and Prometheus metrics
@@ -85,6 +87,21 @@ Railway does not support safe Docker-in-Docker in a normal app service. Isolatio
 10. Confirm `/health/ready` returns ready and check the deployment log for `Telegram bot ... started with webhook sync` before enabling users.
 
 Without Railway variables, the dashboard works but deployments safely enter `failed` with a provider-not-configured error.
+
+## Email and notification automation
+
+Email uses the same SMTP credentials as magic-link authentication:
+
+```env
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=...
+SMTP_PASSWORD=...
+SMTP_FROM=BlazeNXT <notifications@example.com>
+SMTP_STARTTLS=true
+```
+
+Users configure channels and categories at `/account/notifications`. Email and Telegram deliveries are persisted in `delivery_outbox`, retried up to five times with exponential backoff, and visible to administrators at `/admin/deliveries`. Security events always remain in the web inbox even when optional channels are disabled.
 
 ## S3-compatible offsite backups
 

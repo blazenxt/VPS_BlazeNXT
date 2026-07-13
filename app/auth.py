@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import get_db
 from app.models import ApiKey,AuditLog,AuthIdentity,AuthIdentityBlock,AuthTokenUse,User,UserSecurity,UserSessionPolicy
+from app.notifications import emit
 from app.security import decrypt_secret,encrypt_secret,hash_token,read_magic_link,read_oauth_state,read_preauth,read_session,sign_magic_link,sign_oauth_state,sign_preauth,sign_session
 s=get_settings();router=APIRouter();templates=Jinja2Templates(directory='templates');EMAIL=re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
 def providers():return {'google':bool(s.google_client_id and s.google_client_secret),'github':bool(s.github_client_id and s.github_client_secret),'email':bool(s.smtp_host and s.smtp_from)}
@@ -134,7 +135,7 @@ def unlink_identity(identity_id:int,request:Request,confirmation:str=Form(...),c
     provider=identity.provider;db.delete(identity);policy=db.scalar(select(UserSessionPolicy).where(UserSessionPolicy.user_id==uid))
     if not policy:policy=UserSessionPolicy(user_id=uid,revoked_before=datetime.now(timezone.utc));db.add(policy)
     else:policy.revoked_before=datetime.now(timezone.utc)
-    db.add(AuditLog(actor_id=uid,action='identity.unlink',target=f'identity:{provider}',ip=request.client.host if request.client else 'unknown',detail=json.dumps({'provider':provider})));db.commit();response=RedirectResponse('/?unlinked=1',303);response.delete_cookie('blaze_session');return response
+    db.add(AuditLog(actor_id=uid,action='identity.unlink',target=f'identity:{provider}',ip=request.client.host if request.client else 'unknown',detail=json.dumps({'provider':provider})));emit(db,uid,'security.identity_unlinked','Login method unlinked',f'{provider.title()} was removed from your BlazeNXT account. All existing sessions were revoked.');db.commit();response=RedirectResponse('/?unlinked=1',303);response.delete_cookie('blaze_session');return response
 @router.post('/account/api-keys',response_class=HTMLResponse)
 def create_api_key(request:Request,name:str=Form(...),scope_set:str=Form('read'),token:str=Form(...),db:Session=Depends(get_db)):
     session=session_data(request,db)
@@ -168,14 +169,14 @@ def enable_2fa(request:Request,code:str=Form(...),token:str=Form(...),db:Session
     if not session or token!=session.get('csrf'):raise HTTPException(403)
     row=db.scalar(select(UserSecurity).where(UserSecurity.user_id==int(session['uid'])))
     if not row or not pyotp.TOTP(decrypt_secret(row.encrypted_totp_secret)).verify(code,valid_window=1):raise HTTPException(400,'Invalid authenticator code')
-    row.enabled=True;db.commit();return RedirectResponse('/account/security',303)
+    row.enabled=True;emit(db,int(session['uid']),'security.2fa_enabled','Two-factor authentication enabled','TOTP protection is now active on your BlazeNXT account.');db.commit();return RedirectResponse('/account/security',303)
 @router.post('/account/2fa/disable')
 def disable_2fa(request:Request,code:str=Form(...),token:str=Form(...),db:Session=Depends(get_db)):
     session=session_data(request,db)
     if not session or token!=session.get('csrf'):raise HTTPException(403)
     row=db.scalar(select(UserSecurity).where(UserSecurity.user_id==int(session['uid'])))
     if not row or not pyotp.TOTP(decrypt_secret(row.encrypted_totp_secret)).verify(code,valid_window=1):raise HTTPException(400,'Invalid authenticator code')
-    db.delete(row);db.commit();return RedirectResponse('/account/security',303)
+    db.delete(row);emit(db,int(session['uid']),'security.2fa_disabled','Two-factor authentication disabled','TOTP protection was removed from your BlazeNXT account.');db.commit();return RedirectResponse('/account/security',303)
 @router.get('/auth/2fa',response_class=HTMLResponse)
 def two_factor_challenge(request:Request):
     if not read_preauth(request.cookies.get('blaze_preauth','')):return RedirectResponse('/',303)

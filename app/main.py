@@ -16,7 +16,8 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BackupPolicy,HealthSnapshot,Incident,ManagedDatabase,Notification,ObjectBackup,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.notifications import emit,process_outbox
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
@@ -82,6 +83,7 @@ async def schedule_worker():
                     artifact=draft.artifact;db.delete(draft);db.flush();db.delete(artifact)
                 for draft in db.scalars(select(TelegramUploadDraft).where(TelegramUploadDraft.status=='deployed',TelegramUploadDraft.created_at<cutoff).limit(500)).all():db.delete(draft)
                 db.commit()
+            await process_outbox()
         except Exception:logger.exception('Schedule worker failed')
 @asynccontextmanager
 async def lifespan(app):
@@ -274,11 +276,7 @@ async def action(wid:int,action:str,request:Request,u:User=Depends(current),_=De
     w=accessible_workload(wid,u,db,'control')
     if action=='delete' and w.user_id!=u.id and u.role not in {Role.admin,Role.owner}:raise HTTPException(403,'Only the owner can delete')
     try:
-        await perform_action(db,w,action);audit(db,u,f'workload.{action}',f'workload:{wid}',request.client.host if request.client else '');db.commit()
-        try:
-            from app.telegram_bot import send_user_notification
-            await send_user_notification(w.user_id,f'🔄 <b>{w.name}</b>: {action} completed from web panel.')
-        except Exception:pass
+        await perform_action(db,w,action);audit(db,u,f'workload.{action}',f'workload:{wid}',request.client.host if request.client else '');emit(db,w.user_id,f'deployment.{action}',f'{w.name}: {action} completed',f'The {action} action completed from the web panel. Current state: {w.state.value}.');db.commit()
         await dispatch_event(wid,f'workload.{action}',{'source':'web','state':w.state.value})
     except Exception as e:w.last_error=str(e)[:1000];db.commit();raise HTTPException(502,str(e))
     return RedirectResponse(f'/servers/{wid}',303)
@@ -654,21 +652,21 @@ def store(request:Request,u:User=Depends(current)):
 @app.post('/store/request')
 def request_plan(request:Request,plan:str=Form(...),message:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if plan not in {'Premium','Admin'}:raise HTTPException(400,'Invalid plan')
-    db.add(SupportTicket(user_id=u.id,category='billing',subject=f'{plan} plan request',message=message[:2000] or f'Please review my {plan} upgrade request.'));audit(db,u,'plan.request','billing',request.client.host if request.client else '',{'plan':plan});db.commit();return RedirectResponse('/support',303)
+    db.add(SupportTicket(user_id=u.id,category='billing',subject=f'{plan} plan request',message=message[:2000] or f'Please review my {plan} upgrade request.'));audit(db,u,'plan.request','billing',request.client.host if request.client else '',{'plan':plan});emit(db,u.id,'billing.plan_requested',f'{plan} plan requested','Your manual plan request was submitted for administrator review.');db.commit();return RedirectResponse('/support',303)
 @app.get('/support',response_class=HTMLResponse)
 def support(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     tickets=db.scalars(select(SupportTicket).where(SupportTicket.user_id==u.id).order_by(SupportTicket.created_at.desc())).all();return templates.TemplateResponse('support.html',ctx(request,u,tickets=tickets))
 @app.post('/support')
 def create_ticket(request:Request,category:str=Form(...),subject:str=Form(...),message:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if category not in {'technical','billing','abuse','feature'} or not 3<=len(subject)<=120 or not 10<=len(message)<=5000:raise HTTPException(400,'Invalid ticket')
-    ticket=SupportTicket(user_id=u.id,category=category,subject=subject,message=message);db.add(ticket);db.flush();audit(db,u,'ticket.create',f'ticket:{ticket.id}',request.client.host if request.client else '');db.commit();return RedirectResponse('/support',303)
+    ticket=SupportTicket(user_id=u.id,category=category,subject=subject,message=message);db.add(ticket);db.flush();audit(db,u,'ticket.create',f'ticket:{ticket.id}',request.client.host if request.client else '');emit(db,u.id,'support.ticket_created',f'Ticket #{ticket.id} created',f'Your support request “{subject}” was received.');db.commit();return RedirectResponse('/support',303)
 @app.post('/admin/tickets/{tid}')
 def update_ticket(tid:int,request:Request,status:str=Form(...),admin_note:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
     if status not in {'open','in_progress','resolved','closed'}:raise HTTPException(400)
     ticket=db.get(SupportTicket,tid)
     if not ticket:raise HTTPException(404)
-    ticket.status=status;ticket.admin_note=admin_note[:5000];db.add(Notification(user_id=ticket.user_id,title=f'Ticket #{ticket.id} updated',message=f'Status: {status}. {admin_note[:300]}'));audit(db,u,'ticket.update',f'ticket:{tid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin/tickets',303)
+    ticket.status=status;ticket.admin_note=admin_note[:5000];emit(db,ticket.user_id,'support.ticket_updated',f'Ticket #{ticket.id} updated',f'Status: {status}. {admin_note[:300]}');audit(db,u,'ticket.update',f'ticket:{tid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin/tickets',303)
 
 @app.get('/internal/artifacts/{wid}')
 def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
@@ -688,6 +686,19 @@ async def telegram(secret:str,request:Request):
         except IntegrityError:db.rollback();return {'ok':True,'duplicate':True}
     from app.telegram_bot import handle_update
     asyncio.create_task(handle_update(update));return {'ok':True}
+@app.get('/account/notifications',response_class=HTMLResponse)
+def notification_settings(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    pref=db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==u.id))
+    if not pref:pref=NotificationPreference(user_id=u.id);db.add(pref);db.commit();db.refresh(pref)
+    deliveries=db.scalars(select(DeliveryOutbox).where(DeliveryOutbox.user_id==u.id).order_by(DeliveryOutbox.created_at.desc()).limit(100)).all();emails=db.scalars(select(AuthIdentity.email).where(AuthIdentity.user_id==u.id,AuthIdentity.email.is_not(None))).all();categories=set(json.loads(pref.event_categories));return templates.TemplateResponse('notification_settings.html',ctx(request,u,pref=pref,categories=categories,deliveries=deliveries,has_email=bool(emails),smtp_configured=bool(s.smtp_host and s.smtp_from)))
+@app.post('/account/notifications')
+def update_notification_settings(request:Request,web_enabled:bool=Form(False),email_enabled:bool=Form(False),telegram_enabled:bool=Form(False),categories:list[str]=Form([]),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    allowed={'deployment','security','billing','support','incident'};selected=sorted(set(categories)&allowed);pref=db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==u.id))
+    if not pref:pref=NotificationPreference(user_id=u.id);db.add(pref)
+    pref.web_enabled=web_enabled;pref.email_enabled=email_enabled;pref.telegram_enabled=telegram_enabled;pref.event_categories=json.dumps(selected);audit(db,u,'notifications.preferences','account',request.client.host if request.client else '',{'web':web_enabled,'email':email_enabled,'telegram':telegram_enabled,'categories':selected});db.commit();return RedirectResponse('/account/notifications',303)
+@app.post('/account/notifications/test')
+def test_notification(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    emit(db,u.id,'security.test','Test notification','Your BlazeNXT notification automation is configured correctly.');db.commit();return RedirectResponse('/account/notifications',303)
 @app.get('/notifications',response_class=HTMLResponse)
 def notifications_page(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     rows=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(200)).all();return templates.TemplateResponse('notifications.html',ctx(request,u,notifications=rows))
@@ -711,7 +722,7 @@ def redeem_referral(request:Request,code:str=Form(...),u:User=Depends(current),_
     if db.scalar(select(ReferralRedemption).where(ReferralRedemption.referred_user_id==u.id)):raise HTTPException(400,'Referral already redeemed')
     referral=db.scalar(select(ReferralCode).where(ReferralCode.code==code.strip().upper()))
     if not referral or referral.user_id==u.id:raise HTTPException(400,'Invalid referral code')
-    owner_wallet=db.scalar(select(Wallet).where(Wallet.user_id==referral.user_id)) or Wallet(user_id=referral.user_id);user_wallet=db.scalar(select(Wallet).where(Wallet.user_id==u.id)) or Wallet(user_id=u.id);db.add_all([owner_wallet,user_wallet]);owner_wallet.credits+=5;user_wallet.credits+=5;db.add(ReferralRedemption(code_id=referral.id,referred_user_id=u.id));db.add(Notification(user_id=referral.user_id,title='Referral reward',message='You earned 5 Blaze credits.'));db.commit();return RedirectResponse('/account',303)
+    owner_wallet=db.scalar(select(Wallet).where(Wallet.user_id==referral.user_id)) or Wallet(user_id=referral.user_id);user_wallet=db.scalar(select(Wallet).where(Wallet.user_id==u.id)) or Wallet(user_id=u.id);db.add_all([owner_wallet,user_wallet]);owner_wallet.credits+=5;user_wallet.credits+=5;db.add(ReferralRedemption(code_id=referral.id,referred_user_id=u.id));emit(db,referral.user_id,'billing.referral_reward','Referral reward','You earned 5 Blaze credits.');emit(db,u.id,'billing.referral_redeemed','Referral redeemed','You received 5 Blaze credits.');db.commit();return RedirectResponse('/account',303)
 @app.post('/admin/platform-switch')
 def platform_switch(request:Request,enabled:bool=Form(False),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role!=Role.owner:raise HTTPException(403)
@@ -721,27 +732,35 @@ async def create_announcement(request:Request,title:str=Form(...),message:str=Fo
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
     if level not in {'info','warning','maintenance','critical'}:raise HTTPException(400)
     item=Announcement(title=title[:160],message=message[:5000],level=level,created_by=u.id);db.add(item);users=db.scalars(select(User).where(User.banned==False)).all()
-    for target in users:db.add(Notification(user_id=target.id,title=item.title,message=item.message))
+    for target in users:emit(db,target.id,'incident.announcement',item.title,item.message)
     audit(db,u,'announcement.create','platform',request.client.host if request.client else '',{'level':level});db.commit()
-    from app.telegram_bot import send_user_notification
-    await asyncio.gather(*(send_user_notification(target.id,f'📢 <b>{item.title}</b>\n{item.message[:1000]}') for target in users[:25]),return_exceptions=True)
     return RedirectResponse('/admin/announcements',303)
 @app.post('/admin/incidents')
 def create_incident(request:Request,title:str=Form(...),message:str=Form(...),impact:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner} or impact not in {'minor','major','critical'}:raise HTTPException(403)
-    db.add(Incident(title=title[:160],message=message[:5000],impact=impact,created_by=u.id));audit(db,u,'incident.create','platform',request.client.host if request.client else '',{'impact':impact});db.commit();return RedirectResponse('/admin/incidents',303)
+    db.add(Incident(title=title[:160],message=message[:5000],impact=impact,created_by=u.id));users=db.scalars(select(User).where(User.banned==False)).all()
+    for target in users:emit(db,target.id,'incident.opened',title[:160],message[:5000])
+    audit(db,u,'incident.create','platform',request.client.host if request.client else '',{'impact':impact});db.commit();return RedirectResponse('/admin/incidents',303)
 @app.post('/admin/incidents/{incident_id}/resolve')
 def resolve_incident(incident_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
     row=db.get(Incident,incident_id)
     if not row:raise HTTPException(404)
-    row.status='resolved';row.resolved_at=datetime.now(timezone.utc);db.commit();return RedirectResponse('/admin/incidents',303)
+    row.status='resolved';row.resolved_at=datetime.now(timezone.utc)
+    for target in db.scalars(select(User).where(User.banned==False)).all():emit(db,target.id,'incident.resolved',f'Resolved: {row.title}',row.message)
+    db.commit();return RedirectResponse('/admin/incidents',303)
 @app.get('/admin/audit.csv')
 def audit_export(u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
     output=io.StringIO();writer=csv.writer(output);writer.writerow(['id','created_at','actor_id','action','target','ip','detail'])
     for row in db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(10000)).all():writer.writerow([row.id,row.created_at,row.actor_id,row.action,row.target,row.ip,row.detail])
     return Response(output.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="blazenxt-audit.csv"'})
+@app.post('/admin/deliveries/{delivery_id}/retry')
+def retry_delivery(delivery_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
+    row=db.get(DeliveryOutbox,delivery_id)
+    if not row:raise HTTPException(404)
+    row.status='pending';row.attempts=0;row.next_attempt=datetime.now(timezone.utc);row.last_error=None;audit(db,u,'notification.retry',f'delivery:{delivery_id}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin/deliveries',303)
 @app.post('/admin/bot/repair')
 async def repair_bot(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
@@ -756,14 +775,15 @@ def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
 @app.get('/admin/{section}',response_class=HTMLResponse)
 def admin_section(section:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
-    allowed={'users','tickets','announcements','incidents','audit','operations','bot'}
+    allowed={'users','tickets','announcements','incidents','audit','operations','bot','deliveries'}
     if section not in allowed:raise HTTPException(404)
-    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'object_storage_configured':storage.configured,'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
+    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'delivery_rows':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'object_storage_configured':storage.configured,'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
     if section=='users':data['users']=db.scalars(select(User).order_by(User.created_at.desc()).limit(500)).all()
     elif section=='tickets':data['tickets']=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(300)).all()
     elif section=='announcements':data['announcements']=db.scalars(select(Announcement).order_by(Announcement.created_at.desc()).limit(200)).all()
     elif section=='incidents':data['incidents']=db.scalars(select(Incident).order_by(Incident.created_at.desc()).limit(200)).all()
     elif section=='audit':data['audits']=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(500)).all()
+    elif section=='deliveries':data['delivery_rows']=db.scalars(select(DeliveryOutbox).order_by(DeliveryOutbox.created_at.desc()).limit(500)).all()
     return templates.TemplateResponse('admin_section.html',ctx(request,u,**data))
 @app.post('/admin/users/{uid}')
 def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(False),quota_value:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
@@ -771,7 +791,7 @@ def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(Fals
     t=db.get(User,uid)
     if not t:raise HTTPException(404)
     old_role=t.role;t.role=Role(role);t.banned=banned;t.quota=int(quota_value) if quota_value.strip() else None
-    if old_role!=t.role:db.add(PlanEvent(user_id=t.id,old_plan=old_role.value,new_plan=t.role.value,changed_by=u.id));db.add(Notification(user_id=t.id,title='Plan updated',message=f'Your plan changed from {old_role.value} to {t.role.value}.'))
+    if old_role!=t.role:db.add(PlanEvent(user_id=t.id,old_plan=old_role.value,new_plan=t.role.value,changed_by=u.id));emit(db,t.id,'billing.plan_changed','Plan updated',f'Your plan changed from {old_role.value} to {t.role.value}.')
     audit(db,u,'user.update',f'user:{uid}',request.client.host if request.client else '');db.commit();return RedirectResponse('/admin/users',303)
 @app.get('/health/live')
 def live():return {'status':'ok'}

@@ -2,13 +2,14 @@ import json,secrets
 from datetime import datetime,timedelta,timezone
 from sqlalchemy import select
 from app.config import get_settings
-from app.models import AuditLog,Notification,PlatformSetting,Role,RunnerToken,State,WorkloadAllocation,WorkloadVariable
+from app.models import AuditLog,PlatformSetting,Role,RunnerToken,State,WorkloadAllocation,WorkloadVariable
+from app.notifications import emit
 from app.railway import RailwayClient
 from app.security import decrypt_secret,hash_token
 s=get_settings(); QUOTAS={Role.user:2,Role.premium:20,Role.admin:100,Role.owner:1000}
 def quota(u):return u.quota if u.quota is not None else QUOTAS[u.role]
 def audit(db,u,action,target,ip,detail=None):db.add(AuditLog(actor_id=u.id if u else None,action=action,target=target,ip=ip,detail=json.dumps(detail or {},separators=(',',':'))))
-def notify(db,user_id,title,message):db.add(Notification(user_id=user_id,title=title,message=message))
+def notify(db,user_id,event,title,message):emit(db,user_id,event,title,message,telegram=False)
 def workload_variables(db,wid):
     rows=db.scalars(select(WorkloadVariable).where(WorkloadVariable.workload_id==wid)).all();return {x.name:decrypt_secret(x.encrypted_value) for x in rows}
 def issue_runner_token(db,w):
@@ -20,9 +21,9 @@ async def provision(db,w):
     variables={'CONTROL_PLANE_URL':s.web_base_url.rstrip('/'),'RUNNER_TOKEN':raw,'WORKLOAD_ID':str(w.id),'ENTRYPOINT':w.entrypoint,'RUNTIME':w.runtime,**workload_variables(db,w.id)}
     try:
         client=RailwayClient();w.railway_service_id=await client.create(f'blaze-{w.user_id}-{w.id}',variables);allocation=WorkloadAllocation(workload_id=w.id,cpu_vcpus=str(s.default_cpu_vcpus),memory_mb=s.default_memory_mb);db.add(allocation);db.commit();await client.update_limits(w.railway_service_id,s.default_cpu_vcpus,s.default_memory_mb);await client.update_instance(w.railway_service_id,1,'ON_FAILURE',5);w.state=State.running;w.last_error=None
-        notify(db,w.user_id,'Deployment online',f'{w.name} was provisioned successfully.')
+        notify(db,w.user_id,'deployment.completed','Deployment online',f'{w.name} was provisioned successfully.')
     except Exception as e:
-        w.state=State.failed;w.last_error=str(e)[:1000];notify(db,w.user_id,'Deployment failed',f'{w.name}: {w.last_error}')
+        w.state=State.failed;w.last_error=str(e)[:1000];notify(db,w.user_id,'deployment.failed','Deployment failed',f'{w.name}: {w.last_error}')
     db.commit()
     try:
         from app.webhooks import dispatch_event
