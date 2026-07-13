@@ -131,6 +131,9 @@ class PlanEvent(Base):
 class ApiRequestLog(Base):
     __tablename__='api_request_logs'
     id:Mapped[int]=mapped_column(primary_key=True); api_key_id:Mapped[int]=mapped_column(ForeignKey('api_keys.id',ondelete='CASCADE'),index=True); method:Mapped[str]=mapped_column(String(10)); path:Mapped[str]=mapped_column(String(255)); status_code:Mapped[int]=mapped_column(Integer); ip:Mapped[str]=mapped_column(String(64)); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class ProcessedTelegramUpdate(Base):
+    __tablename__='processed_telegram_updates'
+    id:Mapped[int]=mapped_column(primary_key=True); update_id:Mapped[int]=mapped_column(BigInteger,unique=True,index=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

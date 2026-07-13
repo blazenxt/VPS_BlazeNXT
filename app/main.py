@@ -9,28 +9,46 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST,Counter,generate_latest
 from sqlalchemy import func,select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.api_v1 import router as api_v1_router
 from app.auth import login_response,providers as auth_providers,router as auth_router
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,User,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,User,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
 from app.webhooks import dispatch_event,validate_webhook_url
-s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');APP_STARTED=datetime.now(timezone.utc);BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None}
+s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');APP_STARTED=datetime.now(timezone.utc);TELEGRAM_HEADER_SECRET=hashlib.sha256((s.app_secret+s.telegram_webhook_secret).encode()).hexdigest();BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None,'last_checked_at':None,'pending_updates':0,'last_telegram_error':None,'auto_repaired':False}
 async def configure_telegram_webhook():
     import httpx
     webhook=f"{s.web_base_url.rstrip('/')}/telegram/webhook/{s.telegram_webhook_secret}"
+    commands_list=[{'command':'start','description':'Open BlazeNXT control center'},{'command':'servers','description':'List and control workloads'},{'command':'status','description':'Platform and account status'},{'command':'account','description':'Open account and security'},{'command':'deploy','description':'Upload and deploy code'},{'command':'help','description':'Show deployment help'}]
     async with httpx.AsyncClient(timeout=15) as client:
         identity=await client.post(f'https://api.telegram.org/bot{s.bot_token}/getMe');identity.raise_for_status();bot=identity.json()
         if not bot.get('ok'):raise RuntimeError(bot.get('description','Telegram identity rejected'))
-        response=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setWebhook',json={'url':webhook,'drop_pending_updates':False,'allowed_updates':['message','callback_query']});response.raise_for_status();result=response.json()
+        response=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setWebhook',json={'url':webhook,'secret_token':TELEGRAM_HEADER_SECRET,'drop_pending_updates':False,'allowed_updates':['message','callback_query']});response.raise_for_status();result=response.json()
         if not result.get('ok'):raise RuntimeError(result.get('description','Telegram rejected webhook'))
-        commands=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setMyCommands',json={'commands':[{'command':'start','description':'Open BlazeNXT control center'},{'command':'servers','description':'List and control workloads'},{'command':'status','description':'Platform and account status'},{'command':'deploy','description':'Upload and deploy code'},{'command':'help','description':'Show deployment help'}]});commands.raise_for_status()
-    info=bot['result'];BOT_RUNTIME.update({'online':True,'username':info.get('username'),'id':info.get('id'),'webhook':webhook,'error':None,'started_at':datetime.now(timezone.utc).isoformat()});logger.info('Telegram bot @%s started with webhook sync',info.get('username'))
+        commands=await client.post(f'https://api.telegram.org/bot{s.bot_token}/setMyCommands',json={'commands':commands_list});commands.raise_for_status()
+    info=bot['result'];BOT_RUNTIME.update({'online':True,'username':info.get('username'),'id':info.get('id'),'webhook':urlparse(webhook).netloc,'error':None,'started_at':BOT_RUNTIME['started_at'] or datetime.now(timezone.utc).isoformat(),'last_checked_at':datetime.now(timezone.utc).isoformat()});logger.info('Telegram bot @%s started with verified webhook sync',info.get('username'))
+async def inspect_telegram_runtime(repair=True):
+    import httpx
+    expected=f"{s.web_base_url.rstrip('/')}/telegram/webhook/{s.telegram_webhook_secret}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        me=await client.get(f'https://api.telegram.org/bot{s.bot_token}/getMe');me.raise_for_status();me_data=me.json()
+        hook=await client.get(f'https://api.telegram.org/bot{s.bot_token}/getWebhookInfo');hook.raise_for_status();hook_data=hook.json()
+    if not me_data.get('ok') or not hook_data.get('ok'):raise RuntimeError('Telegram runtime inspection failed')
+    info=hook_data['result'];mismatch=info.get('url')!=expected
+    if mismatch and repair:
+        await configure_telegram_webhook();BOT_RUNTIME['auto_repaired']=True;return await inspect_telegram_runtime(False)
+    identity=me_data['result'];BOT_RUNTIME.update({'online':not mismatch,'username':identity.get('username'),'id':identity.get('id'),'webhook':urlparse(info.get('url') or '').netloc,'pending_updates':info.get('pending_update_count',0),'last_telegram_error':info.get('last_error_message'),'last_checked_at':datetime.now(timezone.utc).isoformat(),'error':None if not mismatch else 'Webhook URL mismatch'});return BOT_RUNTIME
+async def bot_monitor_worker():
+    while True:
+        await asyncio.sleep(180)
+        try:await inspect_telegram_runtime(True)
+        except Exception as e:BOT_RUNTIME.update({'online':False,'error':str(e)[:300],'last_checked_at':datetime.now(timezone.utc).isoformat()});logger.exception('Telegram runtime monitor failed')
 async def schedule_worker():
     while True:
         await asyncio.sleep(30)
@@ -48,6 +66,9 @@ async def schedule_worker():
                 if not latest_time or now-latest_time>=timedelta(minutes=5):
                     for workload in db.scalars(select(Workload).where(Workload.state!=State.deleted)).all():db.add(HealthSnapshot(workload_id=workload.id,state=workload.state.value))
                     db.commit()
+                cutoff=now-timedelta(days=7)
+                for update in db.scalars(select(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at<cutoff).limit(500)).all():db.delete(update)
+                db.commit()
         except Exception:logger.exception('Schedule worker failed')
 @asynccontextmanager
 async def lifespan(app):
@@ -57,9 +78,10 @@ async def lifespan(app):
         try:await configure_telegram_webhook()
         except Exception as e:BOT_RUNTIME.update({'online':False,'error':str(e)[:300]});logger.exception('Automatic Telegram bot startup failed')
     else:BOT_RUNTIME.update({'online':False,'error':'Telegram variables or HTTPS base URL are incomplete'})
-    scheduler=asyncio.create_task(schedule_worker())
+    scheduler=asyncio.create_task(schedule_worker());bot_monitor=asyncio.create_task(bot_monitor_worker()) if s.bot_token else None
     yield
     scheduler.cancel()
+    if bot_monitor:bot_monitor.cancel()
 app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router);app.include_router(api_v1_router)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 def safe_frame_origins(raw,allow_none=False):
@@ -554,9 +576,17 @@ def artifact(wid:int,request:Request,db:Session=Depends(get_db)):
     w=db.get(Workload,wid);return Response(w.artifact.data,media_type=w.artifact.content_type,headers={'X-Filename':w.artifact.filename,'X-Content-SHA256':w.artifact.sha256,'Cache-Control':'no-store'})
 @app.post('/telegram/webhook/{secret}')
 async def telegram(secret:str,request:Request):
-    if not secrets.compare_digest(secret,s.telegram_webhook_secret):raise HTTPException(404)
+    header=request.headers.get('X-Telegram-Bot-Api-Secret-Token','')
+    if not secrets.compare_digest(secret,s.telegram_webhook_secret) or not secrets.compare_digest(header,TELEGRAM_HEADER_SECRET):raise HTTPException(404)
+    update=await request.json();update_id=update.get('update_id')
+    if not isinstance(update_id,int):raise HTTPException(400,'Invalid Telegram update')
+    with SessionLocal() as db:
+        if db.scalar(select(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.update_id==update_id)):return {'ok':True,'duplicate':True}
+        db.add(ProcessedTelegramUpdate(update_id=update_id))
+        try:db.commit()
+        except IntegrityError:db.rollback();return {'ok':True,'duplicate':True}
     from app.telegram_bot import handle_update
-    await handle_update(await request.json());return {'ok':True}
+    asyncio.create_task(handle_update(update));return {'ok':True}
 @app.get('/notifications',response_class=HTMLResponse)
 def notifications_page(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     rows=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(200)).all();return templates.TemplateResponse('notifications.html',ctx(request,u,notifications=rows))
@@ -611,6 +641,12 @@ def audit_export(u:User=Depends(current),db:Session=Depends(get_db)):
     output=io.StringIO();writer=csv.writer(output);writer.writerow(['id','created_at','actor_id','action','target','ip','detail'])
     for row in db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(10000)).all():writer.writerow([row.id,row.created_at,row.actor_id,row.action,row.target,row.ip,row.detail])
     return Response(output.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="blazenxt-audit.csv"'})
+@app.post('/admin/bot/repair')
+async def repair_bot(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
+    try:await configure_telegram_webhook();await inspect_telegram_runtime(False);audit(db,u,'telegram.repair','platform',request.client.host if request.client else '');db.commit()
+    except Exception as e:BOT_RUNTIME.update({'online':False,'error':str(e)[:300]});raise HTTPException(502,str(e))
+    return RedirectResponse('/admin/bot',303)
 @app.get('/admin',response_class=HTMLResponse)
 def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
@@ -619,9 +655,9 @@ def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
 @app.get('/admin/{section}',response_class=HTMLResponse)
 def admin_section(section:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
-    allowed={'users','tickets','announcements','incidents','audit','operations'}
+    allowed={'users','tickets','announcements','incidents','audit','operations','bot'}
     if section not in allowed:raise HTTPException(404)
-    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit}
+    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
     if section=='users':data['users']=db.scalars(select(User).order_by(User.created_at.desc()).limit(500)).all()
     elif section=='tickets':data['tickets']=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(300)).all()
     elif section=='announcements':data['announcements']=db.scalars(select(Announcement).order_by(Announcement.created_at.desc()).limit(200)).all()
@@ -641,6 +677,6 @@ def live():return {'status':'ok'}
 @app.get('/health/ready')
 def ready(db:Session=Depends(get_db)):db.execute(select(1));return {'status':'ready','railway_configured':RailwayClient().configured,'telegram_online':BOT_RUNTIME['online']}
 @app.get('/health/bot')
-def bot_health():return {'online':BOT_RUNTIME['online'],'username':BOT_RUNTIME['username'],'started_at':BOT_RUNTIME['started_at'],'error':BOT_RUNTIME['error']}
+def bot_health():return {'online':BOT_RUNTIME['online'],'username':BOT_RUNTIME['username'],'started_at':BOT_RUNTIME['started_at'],'last_checked_at':BOT_RUNTIME['last_checked_at'],'pending_updates':BOT_RUNTIME['pending_updates'],'auto_repaired':BOT_RUNTIME['auto_repaired']}
 @app.get('/metrics')
 def metrics():return Response(generate_latest(),media_type=CONTENT_TYPE_LATEST)

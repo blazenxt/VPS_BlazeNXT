@@ -1,10 +1,10 @@
-import asyncio,hashlib,html,re
+import asyncio,hashlib,html,json,re
 from pathlib import Path
 import httpx
 from sqlalchemy import func,select
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Artifact,Backup,PlatformSetting,Role,State,User,Workload
+from app.models import Artifact,Backup,PlatformSetting,Role,State,User,Workload,WorkloadMember
 from app.railway import RailwayClient
 from app.security import inspect_zip,safe_filename
 from app.services import audit,perform_action,provision,quota
@@ -32,6 +32,25 @@ def user_for(db,tg):
         name=' '.join(filter(None,[tg.get('first_name'),tg.get('last_name')])) or 'User';u=User(telegram_id=tid,username=tg.get('username'),display_name=name,role=Role.owner if tid in s.owners else Role.user);db.add(u);db.commit();db.refresh(u)
     if u.banned:raise PermissionError('Account is suspended')
     return u
+def visible_workloads(db,u):
+    if u.role in {Role.admin,Role.owner}:return db.scalars(select(Workload).where(Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
+    shared=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all();return db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
+def require_workload(db,u,wid,permission='view'):
+    w=db.get(Workload,int(wid))
+    if not w:raise PermissionError('Server not found')
+    if w.user_id==u.id or u.role in {Role.admin,Role.owner}:return w
+    member=db.scalar(select(WorkloadMember).where(WorkloadMember.workload_id==w.id,WorkloadMember.user_id==u.id));permissions=json.loads(member.permissions) if member else []
+    if permission not in permissions:raise PermissionError('You do not have this server permission')
+    return w
+async def sync_workload_state(db,w):
+    if not w.railway_service_id:return w
+    try:
+        deployments=await RailwayClient().deployments(w.railway_service_id)
+        if deployments:
+            status=deployments[0]['status'].upper();mapped=State.running if status=='SUCCESS' else (State.failed if status in {'FAILED','CRASHED'} else (State.stopped if status in {'REMOVED','SLEEPING'} else w.state))
+            if mapped!=w.state:w.state=mapped;db.commit()
+    except Exception:pass
+    return w
 def servers_keyboard(rows):
     buttons=[[{'text':f"{'🟢' if w.state==State.running else '⚪'} {w.name}",'callback_data':f'wl:{w.id}'}] for w in rows[:20]]
     buttons.append([{'text':'🌐 Open web panel','url':s.web_base_url}]);return buttons
@@ -41,7 +60,7 @@ def detail_keyboard(w):return [[{'text':'▶ Start','callback_data':f'act:start:
 async def send_user_notification(user_id,text):
     with SessionLocal() as db:
         u=db.get(User,user_id)
-        if u:await send(u.telegram_id,text,[[{'text':'Open panel','url':s.web_base_url}]])
+        if u and u.telegram_id>0:await send(u.telegram_id,text,[[{'text':'Open panel','url':s.web_base_url}]])
 async def provision_task(wid):
     with SessionLocal() as db:
         w=db.get(Workload,wid)
@@ -77,25 +96,21 @@ async def handle_update(update):
             with SessionLocal() as db:
                 u=user_for(db,tg)
                 if data=='nav:servers':
-                    rows=db.scalars(select(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all();await edit(chat,mid,'<b>Your workloads</b>\nManage the same servers shown on the web panel.',servers_keyboard(rows));return
+                    rows=visible_workloads(db,u);await edit(chat,mid,'<b>Your workloads</b>\nManage the same servers shown on the web panel.',servers_keyboard(rows));return
                 if data=='nav:upload':
                     await edit(chat,mid,'<b>Deploy from Telegram</b>\n\nSend a <code>.py</code>, <code>.js</code> or <code>.zip</code> document. Optional caption:\n<code>name=MyBot runtime=python entry=main.py</code>\n\nConfigure secrets safely in the web panel.',[[{'text':'‹ Back','callback_data':'nav:servers'}]]);return
                 if data.startswith('wl:'):
-                    w=db.get(Workload,int(data.split(':')[1]));
-                    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
+                    w=require_workload(db,u,data.split(':')[1]);await sync_workload_state(db,w)
                     await edit(chat,mid,detail_text(w),detail_keyboard(w));return
                 if data.startswith('act:'):
-                    _,action,wid=data.split(':');w=db.get(Workload,int(wid))
-                    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
+                    _,action,wid=data.split(':');w=require_workload(db,u,wid,'control')
                     await perform_action(db,w,action);audit(db,u,f'workload.{action}.telegram',f'workload:{w.id}','telegram');db.commit();await dispatch_event(w.id,f'workload.{action}',{'source':'telegram'});await edit(chat,mid,detail_text(w),detail_keyboard(w));return
                 if data.startswith('log:'):
-                    w=db.get(Workload,int(data.split(':')[1]))
-                    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
+                    w=require_workload(db,u,data.split(':')[1],'logs')
                     deployments=await RailwayClient().deployments(w.railway_service_id) if w.railway_service_id else [];logs=await RailwayClient().logs(deployments[0]['id']) if deployments else []
                     body='\n'.join(str(x.get('message','')) for x in logs[-30:])[-3500:] or 'No logs available.';await send(chat,f'📜 <b>{html.escape(w.name)} logs</b>\n<pre>{html.escape(body)}</pre>',detail_keyboard(w));return
                 if data.startswith('bak:'):
-                    w=db.get(Workload,int(data.split(':')[1]))
-                    if not w or (w.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise PermissionError('Server not found')
+                    w=require_workload(db,u,data.split(':')[1],'files')
                     a=w.artifact;db.add(Backup(workload_id=w.id,name='Telegram backup',filename=a.filename,sha256=a.sha256,size=a.size,data=a.data));audit(db,u,'backup.create.telegram',f'workload:{w.id}','telegram');db.commit();await send(chat,f'💾 Backup created for <b>{html.escape(w.name)}</b>.',detail_keyboard(w));return
         if not message:return
         tg=message['from'];chat=message['chat']['id'];text=message.get('text','')
@@ -105,10 +120,12 @@ async def handle_update(update):
             if text.startswith('/start'):
                 await send(chat,f"🔥 <b>Welcome to BlazeNXT, {html.escape(u.display_name)}</b>\n\nYour Telegram bot and web panel are fully synchronized. Upload code here or manage deployments on the web.",[[{'text':'🖥 My servers','callback_data':'nav:servers'},{'text':'🌐 Web panel','url':s.web_base_url}],[{'text':'📦 Upload guide','callback_data':'nav:upload'}]]);return
             if text.startswith('/servers'):
-                rows=db.scalars(select(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all();await send(chat,'<b>Your workloads</b>',servers_keyboard(rows));return
+                rows=visible_workloads(db,u);await send(chat,'<b>Your workloads</b>',servers_keyboard(rows));return
             if text.startswith('/status'):
-                rows=db.scalars(select(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)).all();online=sum(1 for w in rows if w.state==State.running);global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
+                rows=visible_workloads(db,u);online=sum(1 for w in rows if w.state==State.running);global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0
                 await send(chat,f'📊 <b>BlazeNXT status</b>\n\nAccount: <b>{u.role.value}</b>\nYour workloads: <b>{len(rows)}</b>\nOnline: <b>{online}</b>\nYour quota: <b>{quota(u)}</b>\nPlatform capacity: <b>{global_active}/{s.global_workload_limit or "∞"}</b>',[[{'text':'My servers','callback_data':'nav:servers'},{'text':'Web dashboard','url':s.web_base_url}]]);return
+            if text.startswith('/account'):
+                await send(chat,f'👤 <b>{html.escape(u.display_name)}</b>\n\nRole: <b>{u.role.value}</b>\nTelegram ID: <code>{u.telegram_id}</code>\nWorkload quota: <b>{quota(u)}</b>',[[{'text':'Account portal','url':f"{s.web_base_url.rstrip('/')}/account"},{'text':'Login & security','url':f"{s.web_base_url.rstrip('/')}/account/security"}]]);return
             if text.startswith('/help') or text.startswith('/deploy'):
                 await send(chat,'<b>Deploy from Telegram</b>\n\nSend a <code>.py</code>, <code>.js</code> or <code>.zip</code> document. Optional caption:\n<code>name=MyBot runtime=python entry=main.py</code>\n\nSecrets and environment variables must be configured securely in the web panel.');return
             await send(chat,'Use /servers to manage workloads or send /help for the upload guide.')
