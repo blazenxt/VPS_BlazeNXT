@@ -76,6 +76,12 @@ class AuthIdentity(Base):
 class AuthTokenUse(Base):
     __tablename__='auth_token_uses'
     id:Mapped[int]=mapped_column(primary_key=True); token_hash:Mapped[str]=mapped_column(String(64),unique=True,index=True); used_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class AuthIdentityBlock(Base):
+    __tablename__='auth_identity_blocks'; __table_args__=(UniqueConstraint('provider','subject','user_id'),)
+    id:Mapped[int]=mapped_column(primary_key=True); provider:Mapped[str]=mapped_column(String(20),index=True); subject:Mapped[str]=mapped_column(String(255)); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class UserSessionPolicy(Base):
+    __tablename__='user_session_policies'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); revoked_before:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
 class ApiKey(Base):
     __tablename__='api_keys'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

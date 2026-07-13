@@ -11,6 +11,7 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Telegram Login, Google OAuth, GitHub OAuth and one-time email magic links
 - Signed HttpOnly sessions, OAuth state/session binding, CSRF protection and rate limiting
 - Multiple verified identities linked to one synchronized BlazeNXT account
+- Safe provider unlink with last-method protection, optional TOTP confirmation, Telegram detachment, relink blocking and global session revocation
 - Python, Node and ZIP uploads with size, zip-slip, zip-bomb and SHA-256 checks
 - Workload-scoped expiring artifact tokens, removed from the child process environment
 - Original, human-designed Pterodactyl + Railway + KataBump-inspired control panel (no proprietary UI/code copied)

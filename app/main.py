@@ -16,7 +16,7 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
@@ -115,6 +115,11 @@ def current(request:Request,db:Session=Depends(get_db)):
     if not p:raise HTTPException(401,'Sign in required')
     u=db.get(User,int(p['uid']))
     if not u or u.banned:raise HTTPException(403,'Account unavailable')
+    policy=db.scalar(select(UserSessionPolicy).where(UserSessionPolicy.user_id==u.id))
+    if policy:
+        issued=float(p.get('iat',0));revoked=policy.revoked_before
+        if revoked.tzinfo is None:revoked=revoked.replace(tzinfo=timezone.utc)
+        if issued<=revoked.timestamp():raise HTTPException(401,'Session was revoked; sign in again')
     request.state.session=p;return u
 def csrf(request:Request,token:str=Form(...)):
     p=getattr(request.state,'session',None) or read_session(request.cookies.get('blaze_session',''))
@@ -148,8 +153,11 @@ def auth(request:Request,db:Session=Depends(get_db)):
     if not u:u=User(telegram_id=tid,username=data.get('username'),display_name=name,role=Role.owner if tid in s.owners else Role.user);db.add(u)
     else:u.username=data.get('username');u.display_name=name;u.role=Role.owner if tid in s.owners else u.role
     db.flush();identity=db.scalar(select(AuthIdentity).where(AuthIdentity.provider=='telegram',AuthIdentity.subject==str(tid)))
+    if linked:
+        block=db.scalar(select(AuthIdentityBlock).where(AuthIdentityBlock.provider=='telegram',AuthIdentityBlock.subject==str(tid),AuthIdentityBlock.user_id==u.id))
+        if block:db.delete(block)
     if not identity:db.add(AuthIdentity(user_id=u.id,provider='telegram',subject=str(tid),display_name=name,avatar_url=data.get('photo_url')))
-    db.commit();db.refresh(u);audit(db,u,'login','web',request.client.host if request.client else '');db.commit();return login_response(u.id,db)
+    db.commit();db.refresh(u);audit(db,u,'login','web',request.client.host if request.client else '');db.commit();return login_response(u.id,db,'telegram')
 @app.post('/logout')
 def logout(request:Request,u=Depends(current),_=Depends(csrf)):
     r=RedirectResponse('/',303);r.delete_cookie('blaze_session');return r

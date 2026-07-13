@@ -4,7 +4,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from itsdangerous import BadSignature,SignatureExpired,URLSafeTimedSerializer
 from app.config import get_settings
 s=get_settings(); signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-session-v1');oauth_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-oauth-state-v1');magic_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-magic-link-v1');preauth_signer=URLSafeTimedSerializer(s.app_secret,salt='blaze-preauth-v1'); SAFE=re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$')
-def sign_session(uid): return signer.dumps({'uid':uid,'csrf':secrets.token_urlsafe(24)})
+def sign_session(uid,provider='unknown'): return signer.dumps({'uid':uid,'csrf':secrets.token_urlsafe(24),'provider':provider,'iat':time.time(),'sid':secrets.token_urlsafe(16)})
 def read_session(v):
     try:return signer.loads(v,max_age=s.session_ttl_seconds)
     except (BadSignature,SignatureExpired):return None
