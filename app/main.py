@@ -4,7 +4,7 @@ from datetime import datetime,timedelta,timezone
 from pathlib import Path,PurePosixPath
 from urllib.parse import urlparse
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
-from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse
+from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST,Counter,generate_latest
@@ -272,11 +272,39 @@ async def action(wid:int,action:str,request:Request,u:User=Depends(current),_=De
         await dispatch_event(wid,f'workload.{action}',{'source':'web','state':w.state.value})
     except Exception as e:w.last_error=str(e)[:1000];db.commit();raise HTTPException(502,str(e))
     return RedirectResponse(f'/servers/{wid}',303)
+async def workload_logs(service_id):
+    if not service_id:return []
+    deployments=await RailwayClient().deployments(service_id)
+    return await RailwayClient().logs(deployments[0]['id']) if deployments else []
 @app.get('/api/workloads/{wid}/logs')
 async def logs(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
-    w=accessible_workload(wid,u,db,'logs')
-    if not w.railway_service_id:return {'logs':[]}
-    ds=await RailwayClient().deployments(w.railway_service_id);return {'logs':await RailwayClient().logs(ds[0]['id']) if ds else []}
+    w=accessible_workload(wid,u,db,'logs');return {'logs':await workload_logs(w.railway_service_id)}
+@app.get('/api/workloads/{wid}/logs/stream')
+async def log_stream(wid:int,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    w=accessible_workload(wid,u,db,'logs');service_id=w.railway_service_id
+    async def event_source():
+        seen=set();first=True
+        while not await request.is_disconnected():
+            try:
+                rows=await workload_logs(service_id)
+                for item in rows[-200:]:
+                    key=f"{item.get('timestamp','')}|{item.get('message','')}|{item.get('severity','')}"
+                    if key in seen:continue
+                    seen.add(key);payload={'timestamp':item.get('timestamp'),'message':str(item.get('message','')),'severity':item.get('severity','info')};yield f"event: log\ndata: {json.dumps(payload,separators=(',',':'))}\n\n"
+                if len(seen)>5000:seen=set(list(seen)[-2500:])
+                if first:yield "event: ready\ndata: {}\n\n";first=False
+            except Exception as e:yield f"event: stream_error\ndata: {json.dumps({'message':str(e)[:250]})}\n\n"
+            yield ": heartbeat\n\n";await asyncio.sleep(5)
+    return StreamingResponse(event_source(),media_type='text/event-stream',headers={'Cache-Control':'no-cache, no-store','X-Accel-Buffering':'no','Connection':'keep-alive'})
+@app.get('/api/workloads/{wid}/logs/download')
+async def download_logs(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    w=accessible_workload(wid,u,db,'logs');rows=await workload_logs(w.railway_service_id);body='\n'.join(f"[{x.get('timestamp','')}] [{x.get('severity','info')}] {x.get('message','')}" for x in rows);name=re.sub(r'[^A-Za-z0-9_.-]','_',w.name)
+    return Response(body,media_type='text/plain; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="{name}-logs.txt"','Cache-Control':'no-store'})
+@app.get('/api/workloads/{wid}/metrics')
+async def workload_metrics(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    w=accessible_workload(wid,u,db);allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid));since=datetime.now(timezone.utc)-timedelta(hours=24);snapshots=db.scalars(select(HealthSnapshot).where(HealthSnapshot.workload_id==wid,HealthSnapshot.created_at>=since).order_by(HealthSnapshot.created_at)).all();history=[{'time':x.created_at.isoformat(),'state':x.state} for x in snapshots[-144:]];healthy=sum(x.state!='failed' for x in snapshots);uptime=round(100*healthy/len(snapshots),2) if snapshots else None
+    deployments=await RailwayClient().deployments(w.railway_service_id) if w.railway_service_id else []
+    return {'state':w.state.value,'uptime_24h':uptime,'history':history,'allocation':{'cpu_vcpus':float(allocation.cpu_vcpus) if allocation else s.default_cpu_vcpus,'memory_mb':allocation.memory_mb if allocation else s.default_memory_mb,'replicas':allocation.replicas if allocation else 1},'latest_deployment':deployments[0] if deployments else None,'note':'Allocation ceilings and recorded health are shown; these are not live CPU/RAM consumption values.'}
 def accessible_workload(wid:int,u:User,db:Session,permission='view'):
     w=db.get(Workload,wid)
     if not w:raise HTTPException(404)
