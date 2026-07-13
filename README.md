@@ -42,7 +42,9 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Automatic pre-change backups, downloadable snapshots and one-click backup restore
 - Server rename, current-artifact reinstall and automatic isolated-service redeployment
 - Encrypted environment variables synchronized to Railway and masked in the panel
-- Manual artifact backups, lifecycle schedules and permission-based server collaborators
+- Local artifact snapshots plus verified S3-compatible offsite backups (AWS S3, Cloudflare R2, B2, MinIO)
+- Scheduled offsite backup policies, integrity metadata checks, count retention and safe restore workflow
+- Lifecycle schedules and permission-based server collaborators
 - Pterodactyl-style application templates/eggs and editable startup configuration
 - Scoped API keys with authenticated `/api/v1` server and power endpoints
 - HMAC-SHA256 outbound webhooks, SSRF destination checks and delivery history
@@ -83,6 +85,23 @@ Railway does not support safe Docker-in-Docker in a normal app service. Isolatio
 10. Confirm `/health/ready` returns ready and check the deployment log for `Telegram bot ... started with webhook sync` before enabling users.
 
 Without Railway variables, the dashboard works but deployments safely enter `failed` with a provider-not-configured error.
+
+## S3-compatible offsite backups
+
+Configure AWS S3, Cloudflare R2, Backblaze B2 or MinIO through Railway secrets:
+
+```env
+S3_ENDPOINT_URL=https://ACCOUNT_ID.r2.cloudflarestorage.com
+S3_REGION=auto
+S3_BUCKET=blazenxt-backups
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+S3_PREFIX=blazenxt
+S3_FORCE_PATH_STYLE=true
+OFFSITE_BACKUP_MAX_MB=50
+```
+
+Credentials never enter the database or user interface. Objects are uploaded with SHA-256 metadata, verified after upload, and verified again before download/restore. Deleting an offsite backup deletes only that managed object. Scheduled retention never touches local snapshots.
 
 ## Iframe configuration
 

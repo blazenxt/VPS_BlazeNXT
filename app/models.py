@@ -144,6 +144,12 @@ class TelegramUploadDraft(Base):
     __tablename__='telegram_upload_drafts'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); artifact_id:Mapped[int]=mapped_column(ForeignKey('artifacts.id',ondelete='CASCADE')); name:Mapped[str]=mapped_column(String(80)); runtime:Mapped[str]=mapped_column(String(16)); entrypoint:Mapped[str]=mapped_column(String(160)); status:Mapped[str]=mapped_column(String(20),default='pending',index=True); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); expires_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),index=True)
     artifact:Mapped[Artifact]=relationship()
+class ObjectBackup(Base):
+    __tablename__='object_backups'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True); provider:Mapped[str]=mapped_column(String(20),default='s3'); bucket:Mapped[str]=mapped_column(String(255)); object_key:Mapped[str]=mapped_column(Text,unique=True); name:Mapped[str]=mapped_column(String(100)); filename:Mapped[str]=mapped_column(String(160)); sha256:Mapped[str]=mapped_column(String(64)); size:Mapped[int]=mapped_column(Integer); state:Mapped[str]=mapped_column(String(20),default='available'); verified_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+class BackupPolicy(Base):
+    __tablename__='backup_policies'
+    id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),unique=True,index=True); enabled:Mapped[bool]=mapped_column(Boolean,default=False); interval_hours:Mapped[int]=mapped_column(Integer,default=24); retention_count:Mapped[int]=mapped_column(Integer,default=7); next_run:Mapped[datetime]=mapped_column(DateTime(timezone=True)); last_run:Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); last_error:Mapped[str|None]=mapped_column(Text); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

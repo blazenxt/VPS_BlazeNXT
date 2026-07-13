@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     frame_sources: str = "https://oauth.telegram.org"
     # JSON list: [{"name":"Tool","url":"https://trusted.example/"}]
     embed_tools_json: str = "[]"
+    # Optional S3-compatible offsite backup storage (AWS S3, R2, B2, MinIO).
+    s3_endpoint_url: str = ''
+    s3_region: str = 'auto'
+    s3_bucket: str = ''
+    s3_access_key_id: str = ''
+    s3_secret_access_key: str = ''
+    s3_prefix: str = 'blazenxt'
+    s3_force_path_style: bool = True
+    offsite_backup_max_mb: int = Field(50, ge=1, le=512)
     owner_ids: str = ''
     max_upload_mb: int = Field(10, ge=1, le=50)
     global_workload_limit: int = Field(0, ge=0, le=10000)

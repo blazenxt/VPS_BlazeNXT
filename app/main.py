@@ -16,10 +16,11 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BackupPolicy,HealthSnapshot,Incident,ManagedDatabase,Notification,ObjectBackup,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
+from app.storage import ObjectStorageError,storage
 from app.webhooks import dispatch_event,validate_webhook_url
 s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');APP_STARTED=datetime.now(timezone.utc);TELEGRAM_HEADER_SECRET=hashlib.sha256((s.app_secret+s.telegram_webhook_secret).encode()).hexdigest();BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None,'last_checked_at':None,'pending_updates':0,'last_telegram_error':None,'auto_repaired':False}
 async def configure_telegram_webhook():
@@ -61,6 +62,15 @@ async def schedule_worker():
                         if w and w.state!=State.deleted:await perform_action(db,w,row.action);audit(db,None,f'schedule.{row.action}',f'workload:{row.workload_id}','scheduler',{'schedule_id':row.id})
                     except Exception as e:audit(db,None,'schedule.failed',f'workload:{row.workload_id}','scheduler',{'error':str(e)[:300]})
                     row.last_run=now;row.next_run=now+timedelta(minutes=row.interval_minutes);db.commit()
+                if storage.configured:
+                    policies=db.scalars(select(BackupPolicy).where(BackupPolicy.enabled==True,BackupPolicy.next_run<=now)).all()
+                    for policy in policies:
+                        workload=db.get(Workload,policy.workload_id)
+                        try:
+                            if workload and workload.state!=State.deleted:
+                                await create_object_backup(db,workload,'Scheduled offsite backup');await enforce_backup_retention(db,workload.id,policy.retention_count);policy.last_run=now;policy.last_error=None
+                        except Exception as e:policy.last_error=str(e)[:500];logger.exception('Scheduled offsite backup failed for workload %s',policy.workload_id)
+                        policy.next_run=now+timedelta(hours=policy.interval_hours);db.commit()
                 latest=db.scalar(select(HealthSnapshot).order_by(HealthSnapshot.created_at.desc()).limit(1));latest_time=latest.created_at if latest else None
                 if latest_time and latest_time.tzinfo is None:latest_time=latest_time.replace(tzinfo=timezone.utc)
                 if not latest_time or now-latest_time>=timedelta(minutes=5):
@@ -371,12 +381,12 @@ async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends
         except Exception as e:provider_error=str(e)
     events=db.scalars(select(AuditLog).where(AuditLog.target==f'workload:{wid}').order_by(AuditLog.created_at.desc()).limit(100)).all()
     variables=db.scalars(select(WorkloadVariable).where(WorkloadVariable.workload_id==wid).order_by(WorkloadVariable.name)).all()
-    backups=db.scalars(select(Backup).where(Backup.workload_id==wid).order_by(Backup.created_at.desc())).all()
+    backups=db.scalars(select(Backup).where(Backup.workload_id==wid).order_by(Backup.created_at.desc())).all();object_backups=db.scalars(select(ObjectBackup).where(ObjectBackup.workload_id==wid,ObjectBackup.state=='available').order_by(ObjectBackup.created_at.desc())).all();backup_policy=db.scalar(select(BackupPolicy).where(BackupPolicy.workload_id==wid))
     members=db.scalars(select(WorkloadMember).where(WorkloadMember.workload_id==wid)).all()
     schedules=db.scalars(select(Schedule).where(Schedule.workload_id==wid).order_by(Schedule.created_at.desc())).all()
     allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid));databases=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id==wid).order_by(ManagedDatabase.created_at.desc())).all();domains=db.scalars(select(WorkloadDomain).where(WorkloadDomain.workload_id==wid).order_by(WorkloadDomain.created_at.desc())).all();webhooks=db.scalars(select(WorkloadWebhook).where(WorkloadWebhook.workload_id==wid).order_by(WorkloadWebhook.created_at.desc())).all();hook_ids=[x.id for x in webhooks];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hook_ids)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hook_ids else []
     is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
-    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning,allocation=allocation,databases=databases,domains=domains,active_database_count=sum(1 for d in databases if d.state=='active'),max_databases=s.max_databases_per_workload))
+    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,object_backups=object_backups,backup_policy=backup_policy,object_storage_configured=storage.configured,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning,allocation=allocation,databases=databases,domains=domains,active_database_count=sum(1 for d in databases if d.state=='active'),max_databases=s.max_databases_per_workload))
 
 @app.get('/servers/{wid}/download')
 def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
@@ -468,6 +478,14 @@ async def delete_variable(wid:int,vid:int,request:Request,u:User=Depends(current
     if w.railway_service_id:await RailwayClient().upsert_variables(w.railway_service_id,{name:''});await RailwayClient().redeploy(w.railway_service_id)
     return RedirectResponse(f'/servers/{wid}?tab=variables',303)
 
+async def create_object_backup(db,w,name='Offsite backup'):
+    artifact=w.artifact;result=await storage.upload(w.id,artifact.filename,artifact.data);record=ObjectBackup(workload_id=w.id,bucket=result['bucket'],object_key=result['key'],name=name[:100],filename=artifact.filename,sha256=result['sha256'],size=result['size']);db.add(record);db.flush();head=await storage.head(record.object_key);remote_sha=(head.get('Metadata') or {}).get('sha256');remote_size=head.get('ContentLength');
+    if remote_sha!=record.sha256 or remote_size!=record.size:record.state='verification_failed';db.commit();raise ObjectStorageError('Uploaded backup verification failed')
+    record.verified_at=datetime.now(timezone.utc);db.commit();return record
+async def enforce_backup_retention(db,wid,retention):
+    rows=db.scalars(select(ObjectBackup).where(ObjectBackup.workload_id==wid,ObjectBackup.state=='available').order_by(ObjectBackup.created_at.desc())).all()
+    for record in rows[max(1,retention):]:
+        await storage.delete(record.object_key);record.state='deleted';db.commit()
 @app.post('/servers/{wid}/backups')
 def create_backup(wid:int,request:Request,name:str=Form('Manual backup'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     w=owned_workload(wid,u,db);a=w.artifact;b=Backup(workload_id=wid,name=name[:100] or 'Manual backup',filename=a.filename,sha256=a.sha256,size=a.size,data=a.data);db.add(b);audit(db,u,'backup.create',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
@@ -481,6 +499,47 @@ def delete_backup(wid:int,bid:int,request:Request,u:User=Depends(current),_=Depe
     owned_workload(wid,u,db);b=db.get(Backup,bid)
     if not b or b.workload_id!=wid:raise HTTPException(404)
     db.delete(b);audit(db,u,'backup.delete',f'workload:{wid}',request.client.host if request.client else '');db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+@app.post('/servers/{wid}/offsite-backups')
+async def create_offsite_backup(wid:int,request:Request,name:str=Form('Manual offsite backup'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    try:record=await create_object_backup(db,w,name)
+    except ObjectStorageError as e:raise HTTPException(502,str(e))
+    audit(db,u,'backup.offsite.create',f'workload:{wid}',request.client.host if request.client else '',{'backup_id':record.id,'size':record.size});db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+@app.get('/servers/{wid}/offsite-backups/{backup_id}')
+async def download_offsite_backup(wid:int,backup_id:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    accessible_workload(wid,u,db,'files');record=db.get(ObjectBackup,backup_id)
+    if not record or record.workload_id!=wid or record.state!='available':raise HTTPException(404)
+    data=await storage.download(record.object_key)
+    if hashlib.sha256(data).hexdigest()!=record.sha256:raise HTTPException(502,'Offsite backup integrity check failed')
+    filename=re.sub(r'[^A-Za-z0-9_.-]','_',record.filename);return Response(data,media_type='application/octet-stream',headers={'Content-Disposition':f'attachment; filename="{filename}"','Cache-Control':'no-store'})
+@app.post('/servers/{wid}/offsite-backups/{backup_id}/verify')
+async def verify_offsite_backup(wid:int,backup_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db);record=db.get(ObjectBackup,backup_id)
+    if not record or record.workload_id!=wid or record.state!='available':raise HTTPException(404)
+    head=await storage.head(record.object_key);valid=head.get('ContentLength')==record.size and (head.get('Metadata') or {}).get('sha256')==record.sha256
+    if not valid:record.state='verification_failed';db.commit();raise HTTPException(502,'Offsite object metadata verification failed')
+    record.verified_at=datetime.now(timezone.utc);audit(db,u,'backup.offsite.verify',f'workload:{wid}',request.client.host if request.client else '',{'backup_id':record.id});db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+@app.post('/servers/{wid}/offsite-backups/{backup_id}/restore')
+async def restore_offsite_backup(wid:int,backup_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db);record=db.get(ObjectBackup,backup_id)
+    if not record or record.workload_id!=wid or record.state!='available':raise HTTPException(404)
+    data=await storage.download(record.object_key)
+    if len(data)!=record.size or hashlib.sha256(data).hexdigest()!=record.sha256:raise HTTPException(502,'Offsite backup integrity check failed')
+    old=w.artifact;db.add(Backup(workload_id=wid,name='Automatic pre-offsite-restore backup',filename=old.filename,sha256=old.sha256,size=old.size,data=old.data));artifact=Artifact(owner_id=w.user_id,filename=record.filename,content_type='application/octet-stream',sha256=record.sha256,size=record.size,data=data);db.add(artifact);db.flush();w.artifact_id=artifact.id;audit(db,u,'backup.offsite.restore',f'workload:{wid}',request.client.host if request.client else '',{'backup_id':record.id});db.commit()
+    if w.railway_service_id:await refresh_artifact(db,w)
+    return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+@app.post('/servers/{wid}/offsite-backups/{backup_id}/delete')
+async def delete_offsite_backup(wid:int,backup_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db);record=db.get(ObjectBackup,backup_id)
+    if not record or record.workload_id!=wid or record.state!='available':raise HTTPException(404)
+    await storage.delete(record.object_key);record.state='deleted';audit(db,u,'backup.offsite.delete',f'workload:{wid}',request.client.host if request.client else '',{'backup_id':record.id});db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
+@app.post('/servers/{wid}/backup-policy')
+def update_backup_policy(wid:int,request:Request,enabled:bool=Form(False),interval_hours:int=Form(24),retention_count:int=Form(7),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    owned_workload(wid,u,db)
+    if not 1<=interval_hours<=720 or not 1<=retention_count<=100:raise HTTPException(400,'Invalid backup policy')
+    row=db.scalar(select(BackupPolicy).where(BackupPolicy.workload_id==wid))
+    if not row:row=BackupPolicy(workload_id=wid,next_run=datetime.now(timezone.utc)+timedelta(hours=interval_hours));db.add(row)
+    row.enabled=enabled;row.interval_hours=interval_hours;row.retention_count=retention_count;row.next_run=datetime.now(timezone.utc)+timedelta(hours=interval_hours);row.last_error=None;audit(db,u,'backup.policy.update',f'workload:{wid}',request.client.host if request.client else '',{'enabled':enabled,'interval_hours':interval_hours,'retention':retention_count});db.commit();return RedirectResponse(f'/servers/{wid}?tab=backups',303)
 
 @app.post('/servers/{wid}/members')
 def add_member(wid:int,request:Request,telegram_id:int=Form(...),permissions:str=Form('view,logs'),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
@@ -699,7 +758,7 @@ def admin_section(section:str,request:Request,u:User=Depends(current),db:Session
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
     allowed={'users','tickets','announcements','incidents','audit','operations','bot'}
     if section not in allowed:raise HTTPException(404)
-    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
+    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'object_storage_configured':storage.configured,'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
     if section=='users':data['users']=db.scalars(select(User).order_by(User.created_at.desc()).limit(500)).all()
     elif section=='tickets':data['tickets']=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(300)).all()
     elif section=='announcements':data['announcements']=db.scalars(select(Announcement).order_by(Announcement.created_at.desc()).limit(200)).all()
@@ -720,5 +779,7 @@ def live():return {'status':'ok'}
 def ready(db:Session=Depends(get_db)):db.execute(select(1));return {'status':'ready','railway_configured':RailwayClient().configured,'telegram_online':BOT_RUNTIME['online']}
 @app.get('/health/bot')
 def bot_health():return {'online':BOT_RUNTIME['online'],'username':BOT_RUNTIME['username'],'started_at':BOT_RUNTIME['started_at'],'last_checked_at':BOT_RUNTIME['last_checked_at'],'pending_updates':BOT_RUNTIME['pending_updates'],'auto_repaired':BOT_RUNTIME['auto_repaired']}
+@app.get('/health/storage')
+def storage_health():return {'configured':storage.configured,'provider':'s3-compatible' if storage.configured else None}
 @app.get('/metrics')
 def metrics():return Response(generate_latest(),media_type=CONTENT_TYPE_LATEST)
