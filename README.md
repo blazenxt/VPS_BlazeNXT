@@ -2,6 +2,8 @@
 
 **Public release line: v1.x.** Internal development iterations do not change the public major version.
 
+Official branding assets are served from `static/blazenxt-logo.png` and `static/blazenxt-favicon.png` and are used across the public site, authenticated panel, project canvas, favicon, and social previews.
+
 Railway-native Telegram bot hosting with a FastAPI website/control plane. Uploaded code is never executed by the website: each workload is provisioned as a separate Railway service using a non-root runner image.
 
 ## Included
