@@ -3,6 +3,6 @@
 .venv
 __pycache__
 .pytest_cache
-legacy
-uploads
-workspace-*.zip
+*.db
+*.sqlite3
+*.log

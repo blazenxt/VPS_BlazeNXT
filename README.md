@@ -115,4 +115,4 @@ docker compose up --build
 - Pin the runner image by digest and add a malware-scanning service before public registration.
 - Review audit logs and automatically expire dormant workloads.
 
-The original monolithic bot is retained under `legacy/` for reference and is not run by BlazeNXT v1.
+The production repository contains only the active BlazeNXT v1 control plane, isolated runner, templates, tests, and deployment configuration.

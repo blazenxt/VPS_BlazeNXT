@@ -17,7 +17,7 @@ from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
 from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,Backup,HealthSnapshot,Incident,ManagedDatabase,Notification,PlanEvent,PlatformSetting,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,User,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.railway import RailwayClient
-from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,sign_session,verify_telegram
+from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
 from app.services import audit,perform_action,provision,quota,refresh_artifact
 from app.webhooks import dispatch_event,validate_webhook_url
 s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');APP_STARTED=datetime.now(timezone.utc);BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None}
