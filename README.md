@@ -24,6 +24,8 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Railway-generated and custom domain provisioning with returned DNS requirements
 - Persistent dark/light themes, collapsible navigation, Ctrl+K command palette and mobile workspace UI
 - Form progress states, drag/drop feedback, keyboard navigation and accessibility-focused controls
+- Installable Android/iPhone/desktop PWA with safe offline fallback, app shortcuts and notification-permission foundation
+- Service worker caches only public shell assets; authentication, API, Telegram and private internal routes are never cached
 - One synchronized identity and workload state across Telegram bot and website
 - Telegram bot auto-start verification, signed webhook-header authentication and command registration
 - Three-minute runtime monitoring, webhook mismatch auto-repair and duplicate-update protection

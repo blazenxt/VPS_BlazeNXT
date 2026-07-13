@@ -1,7 +1,7 @@
 import asyncio,csv,hashlib,io,json,logging,re,secrets,time,zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timedelta,timezone
-from pathlib import PurePosixPath
+from pathlib import Path,PurePosixPath
 from urllib.parse import urlparse
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse
@@ -87,6 +87,9 @@ async def lifespan(app):
     if bot_monitor:bot_monitor.cancel()
 app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router);app.include_router(api_v1_router)
 app.mount('/static',StaticFiles(directory='static'),name='static')
+@app.get('/service-worker.js',include_in_schema=False)
+def service_worker():
+    return Response(Path('static/service-worker.js').read_text(),media_type='application/javascript',headers={'Service-Worker-Allowed':'/','Cache-Control':'no-cache, no-store, must-revalidate'})
 def safe_frame_origins(raw,allow_none=False):
     values=[]
     for item in raw.split(','):
