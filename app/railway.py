@@ -11,6 +11,10 @@ class RailwayClient:
         r.raise_for_status(); body=r.json()
         if body.get('errors'):raise RailwayError(body['errors'][0].get('message','Railway API error'))
         return body['data']
+    async def services(self):
+        q='query($id:String!){project(id:$id){services{edges{node{id name}}}}}';data=await self.gql(q,{'id':self.s.railway_project_id});return [edge['node'] for edge in data['project']['services']['edges']]
+    async def find_service(self,name):
+        return next((item for item in await self.services() if item.get('name')==name),None)
     async def create_image_service(self,name,image,variables=None):
         q='mutation($input:ServiceCreateInput!){serviceCreate(input:$input){id name}}';d=await self.gql(q,{'input':{'projectId':self.s.railway_project_id,'name':name,'source':{'image':image}}});sid=d['serviceCreate']['id']
         if variables:await self.upsert_variables(sid,variables)

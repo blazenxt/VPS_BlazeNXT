@@ -140,7 +140,7 @@ def csrf(request:Request,token:str=Form(...)):
     p=getattr(request.state,'session',None) or read_session(request.cookies.get('blaze_session',''))
     if not p or not secrets.compare_digest(p.get('csrf',''),token):raise HTTPException(403,'Invalid CSRF token')
 def ctx(request,user=None,**extra):
-    p=read_session(request.cookies.get('blaze_session','')) or {};return {'request':request,'user':user,'csrf':p.get('csrf',''),'bot_username':s.bot_username,'bot_runtime':BOT_RUNTIME,**extra}
+    p=read_session(request.cookies.get('blaze_session','')) or {};return {'request':request,'user':user,'csrf':p.get('csrf',''),'bot_username':s.bot_username,'bot_runtime':BOT_RUNTIME,'current_year':datetime.now(timezone.utc).year,**extra}
 def platform_setting(db,key,default='true'):
     row=db.get(PlatformSetting,key);return row.value if row else default
 def deployments_enabled(db):return platform_setting(db,'deployments_enabled','true')=='true'
@@ -271,6 +271,13 @@ async def run_provision(wid):
     with SessionLocal() as db:
         w=db.get(Workload,wid)
         if w:await provision(db,w)
+@app.post('/workloads/{wid}/retry')
+async def retry_provisioning(wid:int,request:Request,bg:BackgroundTasks,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    w=owned_workload(wid,u,db)
+    updated=w.updated_at
+    if updated.tzinfo is None:updated=updated.replace(tzinfo=timezone.utc)
+    if w.state==State.provisioning and datetime.now(timezone.utc)-updated<timedelta(minutes=10):raise HTTPException(409,'Provisioning is already in progress')
+    w.state=State.provisioning;w.last_error=None;audit(db,u,'workload.retry',f'workload:{wid}',request.client.host if request.client else '',{'existing_service_id':w.railway_service_id});db.commit();bg.add_task(run_provision,w.id);return RedirectResponse(f'/servers/{wid}',303)
 @app.post('/workloads/{wid}/{action}')
 async def action(wid:int,action:str,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     w=accessible_workload(wid,u,db,'control')

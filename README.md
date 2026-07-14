@@ -35,6 +35,7 @@ Railway-native Telegram bot hosting with a FastAPI website/control plane. Upload
 - Telegram deployment preview, runtime selector, Deploy & Run, Cancel and 30-minute expiry cleanup
 - Telegram file uploads, server lists, account/platform status, logs, backups and start/stop/restart controls
 - Bidirectional action notifications between web controls and Telegram
+- Resumable Railway provisioning with orphan-service reconciliation, early service-ID persistence, phase-specific errors and owner retry controls
 - Separate Railway service per workload with authenticated SSE live logs, automatic reconnect and polling fallback
 - Searchable pause/resume console, safe text-log download, and bounded browser log history
 - Per-workload Metrics page with 24-hour health snapshots, deployment metadata and allocation ceilings (never fake CPU/RAM usage)
