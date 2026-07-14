@@ -63,6 +63,9 @@ class Schedule(Base):
     id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),index=True)
     name:Mapped[str]=mapped_column(String(100)); action:Mapped[str]=mapped_column(String(20)); interval_minutes:Mapped[int]=mapped_column(Integer); enabled:Mapped[bool]=mapped_column(Boolean,default=True)
     next_run:Mapped[datetime]=mapped_column(DateTime(timezone=True)); last_run:Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class OnboardingState(Base):
+    __tablename__='onboarding_states'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),unique=True,index=True); completed:Mapped[bool]=mapped_column(Boolean,default=False); dismissed:Mapped[bool]=mapped_column(Boolean,default=False); completed_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
 class Notification(Base):
     __tablename__='notifications'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)

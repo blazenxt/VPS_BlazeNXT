@@ -16,7 +16,7 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.notifications import emit,process_outbox
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
@@ -178,13 +178,28 @@ def auth(request:Request,db:Session=Depends(get_db)):
 @app.post('/logout')
 def logout(request:Request,u=Depends(current),_=Depends(csrf)):
     r=RedirectResponse('/',303);r.delete_cookie('blaze_session');return r
+def onboarding_steps(db,u):
+    identities=db.scalars(select(AuthIdentity).where(AuthIdentity.user_id==u.id)).all();security=db.scalar(select(UserSecurity).where(UserSecurity.user_id==u.id));preference=db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==u.id));workload=db.scalar(select(Workload.id).where(Workload.user_id==u.id,Workload.state!=State.deleted).limit(1));steps=[{'key':'identity','title':'Secure your login','description':'Link at least two verified sign-in methods for account recovery.','done':len(identities)>=2,'url':'/account/security'},{'key':'two_factor','title':'Enable two-factor authentication','description':'Protect owner and billing actions with an authenticator app.','done':bool(security and security.enabled),'url':'/account/2fa/setup'},{'key':'telegram','title':'Connect Telegram control','description':'Use the bot for uploads, status, logs and power controls.','done':u.telegram_id>0,'url':f'https://t.me/{s.bot_username}' if s.bot_username else '/account/security'},{'key':'notifications','title':'Choose notification channels','description':'Configure web, email and Telegram automation.','done':bool(preference),'url':'/account/notifications'},{'key':'workload','title':'Deploy your first workload','description':'Upload a Python, Node.js or ZIP project and run it in isolation.','done':bool(workload),'url':'/dashboard#deploy'}]
+    if u.role in {Role.admin,Role.owner}:steps.insert(0,{'key':'platform','title':'Verify platform services','description':'Confirm Railway API, PostgreSQL and Telegram runtime readiness.','done':RailwayClient().configured and BOT_RUNTIME['online'],'url':'/admin'})
+    return steps
+@app.get('/onboarding',response_class=HTMLResponse)
+def onboarding(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    steps=onboarding_steps(db,u);done=sum(x['done'] for x in steps);state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id));return templates.TemplateResponse('onboarding.html',ctx(request,u,steps=steps,done=done,total=len(steps),percent=round(done*100/len(steps)),state=state))
+@app.post('/onboarding/complete')
+def complete_onboarding(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    steps=onboarding_steps(db,u)
+    if not any(x['key']=='workload' and x['done'] for x in steps):raise HTTPException(400,'Deploy at least one workload before completing onboarding')
+    state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id)) or OnboardingState(user_id=u.id);db.add(state);state.completed=True;state.dismissed=False;state.completed_at=datetime.now(timezone.utc);audit(db,u,'onboarding.complete','account',request.client.host if request.client else '');db.commit();return RedirectResponse('/dashboard',303)
+@app.post('/onboarding/dismiss')
+def dismiss_onboarding(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id)) or OnboardingState(user_id=u.id);db.add(state);state.dismissed=True;audit(db,u,'onboarding.dismiss','account',request.client.host if request.client else '');db.commit();return RedirectResponse('/dashboard',303)
 @app.get('/dashboard',response_class=HTMLResponse)
 def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     shared_ids=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all()
     ws=db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared_ids)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
     notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
     global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;visible_ids=[w.id for w in ws];allocations=db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(visible_ids))).all() if visible_ids else [];container_count=sum(x.replicas for x in allocations)+(len(ws)-len(allocations))
-    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,container_count=container_count,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS))
+    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,container_count=container_count,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS,onboarding_state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id)),onboarding_steps=onboarding_steps(db,u)))
 def configured_embed_tools():
     try:items=json.loads(s.embed_tools_json)
     except json.JSONDecodeError:return []

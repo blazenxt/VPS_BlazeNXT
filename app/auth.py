@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db import get_db
-from app.models import ApiKey,AuditLog,AuthIdentity,AuthIdentityBlock,AuthTokenUse,User,UserSecurity,UserSessionPolicy
+from app.models import ApiKey,AuditLog,AuthIdentity,AuthIdentityBlock,AuthTokenUse,OnboardingState,User,UserSecurity,UserSessionPolicy,Workload
 from app.notifications import emit
 from app.security import decrypt_secret,encrypt_secret,hash_token,read_magic_link,read_oauth_state,read_preauth,read_session,sign_magic_link,sign_oauth_state,sign_preauth,sign_session
 s=get_settings();router=APIRouter();templates=Jinja2Templates(directory='templates');EMAIL=re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
@@ -26,11 +26,14 @@ def session_data(request,db=None):
             if float(session.get('iat',0))<=revoked.timestamp():return None
     return session
 def synthetic_telegram_id(provider,subject):return -1-int.from_bytes(hashlib.sha256(f'{provider}:{subject}'.encode()).digest()[:7],'big')
+def post_login_target(uid,db):
+    state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==uid));has_workload=bool(db.scalar(select(Workload.id).where(Workload.user_id==uid).limit(1)))
+    return '/onboarding' if not has_workload and not (state and (state.completed or state.dismissed)) else '/dashboard'
 def login_response(uid,db,provider='unknown'):
     security=db.scalar(select(UserSecurity).where(UserSecurity.user_id==uid,UserSecurity.enabled==True))
     if security:
         r=RedirectResponse('/auth/2fa',303);r.set_cookie('blaze_preauth',sign_preauth(uid),httponly=True,secure=s.production,samesite='lax',max_age=300);r.set_cookie('blaze_preauth_provider',provider,httponly=True,secure=s.production,samesite='lax',max_age=300);return r
-    r=RedirectResponse('/dashboard',303);r.set_cookie('blaze_session',sign_session(uid,provider),httponly=True,secure=s.production,samesite='lax',max_age=s.session_ttl_seconds);return r
+    r=RedirectResponse(post_login_target(uid,db),303);r.set_cookie('blaze_session',sign_session(uid,provider),httponly=True,secure=s.production,samesite='lax',max_age=s.session_ttl_seconds);return r
 def identity_login(db,provider,subject,email,name,avatar=None,link_uid=None):
     identity=db.scalar(select(AuthIdentity).where(AuthIdentity.provider==provider,AuthIdentity.subject==str(subject)))
     if identity:
@@ -192,4 +195,4 @@ def verify_two_factor(request:Request,code:str=Form(...),db:Session=Depends(get_
         recovery=json.loads(decrypt_secret(row.encrypted_recovery_codes));fingerprint=hash_token(code.strip())
         if fingerprint in recovery:recovery.remove(fingerprint);row.encrypted_recovery_codes=encrypt_secret(json.dumps(recovery));db.commit();valid=True
     if not valid:raise HTTPException(401,'Invalid authenticator or recovery code')
-    provider=request.cookies.get('blaze_preauth_provider','unknown');response=RedirectResponse('/dashboard',303);response.delete_cookie('blaze_preauth');response.delete_cookie('blaze_preauth_provider');response.set_cookie('blaze_session',sign_session(uid,provider),httponly=True,secure=s.production,samesite='lax',max_age=s.session_ttl_seconds);return response
+    provider=request.cookies.get('blaze_preauth_provider','unknown');response=RedirectResponse(post_login_target(uid,db),303);response.delete_cookie('blaze_preauth');response.delete_cookie('blaze_preauth_provider');response.set_cookie('blaze_session',sign_session(uid,provider),httponly=True,secure=s.production,samesite='lax',max_age=s.session_ttl_seconds);return response

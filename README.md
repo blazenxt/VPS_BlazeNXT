@@ -447,6 +447,16 @@ Sign in with Telegram, Google, GitHub or email magic link.
 
 The Telegram ID listed in `OWNER_IDS` becomes the owner.
 
+### First-login onboarding
+
+A new account without workloads is redirected to:
+
+```text
+/onboarding
+```
+
+The guided checklist verifies platform readiness, multiple login identities, TOTP 2FA, Telegram linking, notification preferences and the first workload. Existing users with workloads go directly to the dashboard. Users may skip the wizard and reopen it later from **Personal → Setup guide**.
+
 ---
 
 ## 15. Upload a workload from the website
