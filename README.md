@@ -1,4 +1,4 @@
-# BlazeNXT v1 — Complete Setup Guide
+# BlazeNXT v1.0.0 — Complete Step-by-Step Setup Guide
 
 BlazeNXT is a Railway-native hosting control plane for Python and Node.js bots. The web panel and Telegram bot share the same PostgreSQL database, while every uploaded workload runs as a separate Railway service using the BlazeNXT runner image.
 
@@ -33,7 +33,7 @@ Before starting, prepare:
 - Your numeric Telegram user ID
 - Railway PostgreSQL service
 - Railway account/workspace API token
-- Optional custom domain such as `hosting.blazenxt.in`
+- Optional custom domain such as `panel.your-domain.example`
 
 Optional integrations:
 
@@ -41,6 +41,26 @@ Optional integrations:
 - GitHub OAuth
 - SMTP email
 - S3, Cloudflare R2, Backblaze B2 or MinIO
+
+### Choose the public hostname used throughout this guide
+
+Use exactly one option:
+
+```text
+Option A — Railway domain: YOUR-APP.up.railway.app
+Option B — Custom domain:  YOUR-DOMAIN
+```
+
+In the remaining examples, `YOUR-HOST` means the hostname selected above.
+
+Examples:
+
+```text
+YOUR-HOST = your-app-production.up.railway.app
+YOUR-HOST = panel.example.com
+```
+
+Do not include `http://`, `https://` or a trailing slash when a field asks only for the hostname. Use `https://YOUR-HOST` when a complete URL is required.
 
 ---
 
@@ -100,7 +120,7 @@ Open the BlazeNXT service → **Variables** and add:
 ```env
 APP_ENV=production
 APP_SECRET=REPLACE_WITH_64_CHARACTER_HEX_SECRET
-WEB_BASE_URL=https://hosting.blazenxt.in
+WEB_BASE_URL=https://YOUR-HOST
 
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 
@@ -188,10 +208,10 @@ Set the domain:
 /setdomain
 ```
 
-Enter only:
+Enter the same hostname selected earlier:
 
 ```text
-hosting.blazenxt.in
+YOUR-HOST
 ```
 
 Do not include `https://` in BotFather.
@@ -212,40 +232,45 @@ On startup, BlazeNXT automatically:
 Bot health:
 
 ```text
-https://hosting.blazenxt.in/health/bot
+https://YOUR-HOST/health/bot
 ```
 
 Admin diagnostics:
 
 ```text
-https://hosting.blazenxt.in/admin/bot
+https://YOUR-HOST/admin/bot
 ```
 
 ---
 
-## 8. Configure the custom domain
+## 8. Configure the public domain
 
-In Railway:
+### Option A — Railway-generated domain
 
 1. Open the BlazeNXT service.
 2. Open **Settings → Networking**.
-3. Add `hosting.blazenxt.in`.
+3. Click **Generate Domain**.
+4. Copy the hostname, for example `your-app-production.up.railway.app`.
+5. Set:
+
+```env
+WEB_BASE_URL=https://YOUR-APP.up.railway.app
+```
+
+### Option B — Your custom domain
+
+1. Open the BlazeNXT service.
+2. Open **Settings → Networking**.
+3. Add `YOUR-DOMAIN`, for example `panel.example.com`.
 4. Add Railway’s required DNS record at your DNS provider.
 5. Wait for SSL certificate issuance.
-
-Set:
-
-```env
-WEB_BASE_URL=https://hosting.blazenxt.in
-```
-
-Do not include a trailing slash.
-
-If using only the Railway domain:
+6. Set:
 
 ```env
-WEB_BASE_URL=https://vpsblazenxt-production.up.railway.app
+WEB_BASE_URL=https://YOUR-DOMAIN
 ```
+
+Use only one public URL and do not include a trailing slash.
 
 ---
 
@@ -260,13 +285,13 @@ Web application
 Authorized origin:
 
 ```text
-https://hosting.blazenxt.in
+https://YOUR-HOST
 ```
 
 Authorized redirect URI:
 
 ```text
-https://hosting.blazenxt.in/auth/google/callback
+https://YOUR-HOST/auth/google/callback
 ```
 
 Railway variables:
@@ -287,13 +312,13 @@ Create a GitHub OAuth App.
 Homepage:
 
 ```text
-https://hosting.blazenxt.in
+https://YOUR-HOST
 ```
 
 Callback:
 
 ```text
-https://hosting.blazenxt.in/auth/github/callback
+https://YOUR-HOST/auth/github/callback
 ```
 
 Railway variables:
@@ -396,10 +421,10 @@ Redeploy the BlazeNXT service after adding variables.
 Check:
 
 ```text
-https://hosting.blazenxt.in/health/live
-https://hosting.blazenxt.in/health/ready
-https://hosting.blazenxt.in/health/bot
-https://hosting.blazenxt.in/health/storage
+https://YOUR-HOST/health/live
+https://YOUR-HOST/health/ready
+https://YOUR-HOST/health/bot
+https://YOUR-HOST/health/storage
 ```
 
 Expected readiness response:
@@ -415,7 +440,7 @@ Expected readiness response:
 Open:
 
 ```text
-https://hosting.blazenxt.in
+https://YOUR-HOST
 ```
 
 Sign in with Telegram, Google, GitHub or email magic link.
@@ -596,4 +621,4 @@ Increase resources only after reviewing Railway usage metrics.
 /status                    Public status page
 ```
 
-BlazeNXT public release line: **v1.x**.
+BlazeNXT version: **v1.0.0**.
