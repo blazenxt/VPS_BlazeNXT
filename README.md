@@ -586,7 +586,25 @@ Useful diagnostics:
 X-Request-ID        unique ID returned on every dynamic response
 ```
 
-Production logs are structured JSON when `JSON_LOGS=true` and include method, path, status, duration, client IP and request ID. HTML errors show a safe error page; API errors remain JSON.
+Production logs are structured JSON when `JSON_LOGS=true` and include method, path, status, duration, client IP and request ID. API errors remain JSON.
+
+Browser requests receive dedicated responsive frontends for:
+
+```text
+400 Invalid request
+401 Sign in required
+403 Access denied
+404 Page not found
+409 Action conflict
+413 Upload too large
+422 Validation failed
+429 Too many requests
+500 Internal server error
+502 Provider request failed
+503 Service temporarily unavailable
+```
+
+Each page includes a code-specific visual, safe explanation, context-aware action, back/status controls and a copyable request ID. Technical details appear only for safe client errors; 5xx stack traces remain private.
 
 Create future migrations with:
 

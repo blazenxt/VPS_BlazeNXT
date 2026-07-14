@@ -4,6 +4,7 @@ from datetime import datetime,timedelta,timezone
 from pathlib import Path,PurePosixPath
 from urllib.parse import urlparse
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -143,6 +144,19 @@ async def security_headers(request,call_next):
     duration=round((time.perf_counter()-started)*1000,2);REQ.labels(request.method,request.url.path,response.status_code).inc()
     if not request.url.path.startswith(('/static/','/health/')):logger.info('http request',extra={'request_id':request_id,'method':request.method,'path':request.url.path,'status':response.status_code,'duration_ms':duration,'client_ip':ip})
     return response
+ERROR_PAGES={
+    400:{'icon':'!','tone':'warning','title':'Invalid request','description':'Some submitted information was missing or invalid. Review the form and try again.','action':'Review dashboard','url':'/dashboard'},
+    401:{'icon':'⌾','tone':'auth','title':'Sign in required','description':'Your session is missing, expired or was revoked for security. Sign in again to continue.','action':'Sign in','url':'/'},
+    403:{'icon':'⊘','tone':'danger','title':'Access denied','description':'Your account does not have permission to perform this action.','action':'Open dashboard','url':'/dashboard'},
+    404:{'icon':'◇','tone':'neutral','title':'Page not found','description':'The requested page or resource does not exist, or it may have been moved.','action':'Open dashboard','url':'/dashboard'},
+    409:{'icon':'↻','tone':'warning','title':'Action conflict','description':'The resource changed or an operation is already running. Refresh its state before retrying.','action':'Open dashboard','url':'/dashboard'},
+    413:{'icon':'⇧','tone':'warning','title':'Upload too large','description':'The uploaded file exceeds the configured limit. Reduce its size and upload again.','action':'Return to deployment','url':'/dashboard#deploy'},
+    422:{'icon':'≋','tone':'warning','title':'Validation failed','description':'One or more fields could not be validated. Correct the highlighted data and retry.','action':'Open dashboard','url':'/dashboard'},
+    429:{'icon':'◷','tone':'warning','title':'Too many requests','description':'The rate limit was reached. Wait briefly before trying the action again.','action':'Try again','url':'#retry'},
+    500:{'icon':'×','tone':'danger','title':'Internal server error','description':'BlazeNXT recorded an unexpected error. No credentials were exposed in this response.','action':'View system status','url':'/status'},
+    502:{'icon':'↯','tone':'danger','title':'Provider request failed','description':'Railway, Telegram, storage or another upstream provider did not complete the request.','action':'Open dashboard','url':'/dashboard'},
+    503:{'icon':'⚙','tone':'maintenance','title':'Service temporarily unavailable','description':'The platform is starting, migrating, under maintenance or temporarily unable to accept this action.','action':'View system status','url':'/status'}
+}
 def wants_json(request):return request.url.path.startswith(('/api/','/health/','/telegram/','/internal/')) or 'application/json' in request.headers.get('accept','')
 def error_user(request):
     try:
@@ -151,16 +165,25 @@ def error_user(request):
             with SessionLocal() as db:return db.get(User,int(payload['uid']))
     except Exception:pass
     return None
+def error_page_context(request,status,detail=None):
+    page=ERROR_PAGES.get(status,{'icon':'!','tone':'neutral','title':'Request failed','description':'The request could not be completed.','action':'Open dashboard','url':'/dashboard'}).copy();user=error_user(request)
+    if not user and page['url'].startswith('/dashboard'):page.update({'action':'Return home','url':'/'})
+    return ctx(request,user,status_code=status,error_icon=page['icon'],error_tone=page['tone'],error_title=page['title'],error_message=page['description'],error_action=page['action'],error_url=page['url'],technical_detail=detail if status<500 else None,request_id=getattr(request.state,'request_id',uuid.uuid4().hex),request_path=request.url.path)
 @app.exception_handler(StarletteHTTPException)
 async def http_error(request:Request,exc:StarletteHTTPException):
     request_id=getattr(request.state,'request_id',uuid.uuid4().hex);detail=str(exc.detail)
     if wants_json(request):return JSONResponse({'detail':detail,'request_id':request_id},status_code=exc.status_code,headers=getattr(exc,'headers',None))
-    return templates.TemplateResponse(request,'error.html',ctx(request,error_user(request),status_code=exc.status_code,error_title='Request could not be completed',error_message=detail,request_id=request_id),status_code=exc.status_code,headers=getattr(exc,'headers',None))
+    return templates.TemplateResponse(request,'error.html',error_page_context(request,exc.status_code,detail),status_code=exc.status_code,headers=getattr(exc,'headers',None))
+@app.exception_handler(RequestValidationError)
+async def validation_error(request:Request,exc:RequestValidationError):
+    request_id=getattr(request.state,'request_id',uuid.uuid4().hex)
+    if wants_json(request):return JSONResponse({'detail':'Validation failed','errors':exc.errors(),'request_id':request_id},status_code=422)
+    return templates.TemplateResponse(request,'error.html',error_page_context(request,422,'Check required fields, data types and accepted values.'),status_code=422)
 @app.exception_handler(Exception)
 async def unhandled_error(request:Request,exc:Exception):
     request_id=getattr(request.state,'request_id',uuid.uuid4().hex);logger.exception('unhandled request error',extra={'request_id':request_id,'method':request.method,'path':request.url.path,'status':500,'client_ip':request.client.host if request.client else 'unknown'})
     if wants_json(request):return JSONResponse({'detail':'Internal server error','request_id':request_id},status_code=500)
-    return templates.TemplateResponse(request,'error.html',ctx(request,error_user(request),status_code=500,error_title='Something went wrong',error_message='The error was recorded. Use the request ID when contacting support.',request_id=request_id),status_code=500)
+    return templates.TemplateResponse(request,'error.html',error_page_context(request,500),status_code=500)
 def current(request:Request,db:Session=Depends(get_db)):
     p=read_session(request.cookies.get('blaze_session',''))
     if not p:raise HTTPException(401,'Sign in required')
