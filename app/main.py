@@ -119,6 +119,8 @@ async def security_headers(request,call_next):
     ip=request.client.host if request.client else 'unknown';key=f'{ip}:{request.url.path}';now=time.time();hits=[x for x in rate.get(key,[]) if now-x<60];limit=20 if request.url.path.startswith(('/auth','/api')) else 120
     if len(hits)>=limit:return JSONResponse({'detail':'rate limit exceeded'},429)
     hits.append(now);rate[key]=hits;response=await call_next(request)
+    if response.headers.get('content-type','').startswith('text/html'):
+        response.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0';response.headers['Pragma']='no-cache';response.headers['Expires']='0'
     csp="default-src 'self'; img-src 'self' data: https://t.me; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; frame-src 'self' "+' '.join(FRAME_SOURCES)+"; frame-ancestors "+' '.join(FRAME_ANCESTORS)
     headers={'X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':csp,'Strict-Transport-Security':'max-age=31536000; includeSubDomains'}
     if FRAME_ANCESTORS==["'none'"]:headers['X-Frame-Options']='DENY'
@@ -152,8 +154,7 @@ def public_status(request:Request,db:Session=Depends(get_db)):
 def public_status_api(db:Session=Depends(get_db)):
     total=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;online=db.scalar(select(func.count()).select_from(Workload).where(Workload.state==State.running)) or 0;active=db.scalar(select(func.count()).select_from(Incident).where(Incident.status!='resolved')) or 0;return {'status':'operational' if active==0 else 'degraded','services':{'total':total,'online':online},'active_incidents':active,'telegram_online':BOT_RUNTIME['online']}
 @app.get('/',response_class=HTMLResponse)
-def home(request:Request,db:Session=Depends(get_db)):
-    announcements=db.scalars(select(Announcement).where(Announcement.active==True).order_by(Announcement.created_at.desc()).limit(3)).all();return templates.TemplateResponse('home.html',ctx(request,auth_providers=auth_providers(),announcements=announcements))
+def home(request:Request):return templates.TemplateResponse('home.html',ctx(request,auth_providers=auth_providers()))
 @app.get('/auth/telegram')
 def auth(request:Request,db:Session=Depends(get_db)):
     data=dict(request.query_params)
