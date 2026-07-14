@@ -14,3 +14,4 @@ boto3==1.39.4
 pillow==11.3.0
 alembic==1.16.4
 pywebpush==2.0.3
+qrcode[pil]==8.2

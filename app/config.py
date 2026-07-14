@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     vapid_public_key: str = ''
     vapid_private_key: str = ''
     vapid_subject: str = 'mailto:admin@example.com'
+    billing_enabled: bool = False
+    billing_upi_id: str = ''
+    billing_payee_name: str = 'BlazeNXT'
+    billing_currency: str = 'INR'
+    payment_proof_max_mb: int = Field(2, ge=1, le=10)
     owner_ids: str = ''
     max_upload_mb: int = Field(10, ge=1, le=50)
     global_workload_limit: int = Field(0, ge=0, le=10000)

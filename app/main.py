@@ -2,7 +2,8 @@ import asyncio,csv,hashlib,io,json,logging,re,secrets,time,uuid,zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timedelta,timezone
 from pathlib import Path,PurePosixPath
-from urllib.parse import urlparse
+from urllib.parse import urlencode,urlparse
+import qrcode
 from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Request,Response,UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse,StreamingResponse
@@ -23,7 +24,7 @@ from app.config import get_settings
 from app.db import SessionLocal,get_db
 from app.logging_config import configure_logging
 from app.migrations import MIGRATION_STATUS,run_migrations
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BrandAsset,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,PushSubscription,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BrandAsset,BackupPolicy,BillingInvoice,BillingPlan,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PaymentProof,PaymentRequest,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,PushSubscription,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,Subscription,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.notifications import emit,process_outbox
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
@@ -79,6 +80,12 @@ async def schedule_worker():
                                 await create_object_backup(db,workload,'Scheduled offsite backup');await enforce_backup_retention(db,workload.id,policy.retention_count);policy.last_run=now;policy.last_error=None
                         except Exception as e:policy.last_error=str(e)[:500];logger.exception('Scheduled offsite backup failed for workload %s',policy.workload_id)
                         policy.next_run=now+timedelta(hours=policy.interval_hours);db.commit()
+                expired=db.scalars(select(Subscription).where(Subscription.active==True,Subscription.ends_at<=now)).all()
+                for subscription in expired:
+                    subscription.active=False;customer=db.get(User,subscription.user_id)
+                    if customer and customer.role==Role.premium:
+                        old=customer.role;customer.role=Role.user;db.add(PlanEvent(user_id=customer.id,old_plan=old.value,new_plan='user',changed_by=None));emit(db,customer.id,'billing.subscription_expired','Subscription expired','Your premium subscription expired and the account returned to the free plan.')
+                    db.commit()
                 latest=db.scalar(select(HealthSnapshot).order_by(HealthSnapshot.created_at.desc()).limit(1));latest_time=latest.created_at if latest else None
                 if latest_time and latest_time.tzinfo is None:latest_time=latest_time.replace(tzinfo=timezone.utc)
                 if not latest_time or now-latest_time>=timedelta(minutes=5):
@@ -726,14 +733,43 @@ async def rollback_deployment(wid:int,did:str,request:Request,u:User=Depends(cur
     if did not in {x['id'] for x in deployments}:raise HTTPException(404,'Deployment not found')
     await RailwayClient().rollback(did);w.state=State.running;audit(db,u,'deployment.rollback',f'workload:{wid}',request.client.host if request.client else '',{'deployment_id':did});db.commit();return RedirectResponse(f'/servers/{wid}?tab=deployments',303)
 
+def ensure_default_billing_plans(db):
+    if db.scalar(select(BillingPlan.id).limit(1)):return
+    db.add_all([BillingPlan(code='premium-monthly',name='Premium Monthly',description='Premium hosting features for 30 days.',amount_paise=19900,duration_days=30,grants_role='premium',active=True,featured=True),BillingPlan(code='premium-quarterly',name='Premium Quarterly',description='Premium hosting features for 90 days.',amount_paise=49900,duration_days=90,grants_role='premium',active=True,featured=False)]);db.commit()
 @app.get('/store',response_class=HTMLResponse)
-def store(request:Request,u:User=Depends(current)):
-    plans=[{'name':'Free','price':'₹0','slots':2,'features':['Telegram + web sync','Logs and controls','Manual backups']},{'name':'Premium','price':'Manual','slots':20,'features':['Schedules and variables','Collaborators','Priority support']},{'name':'Admin','price':'Private','slots':100,'features':['Platform operations','User management','Extended quotas']}]
-    return templates.TemplateResponse(request,'store.html',ctx(request,u,plans=plans))
+def store(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    ensure_default_billing_plans(db);plans=db.scalars(select(BillingPlan).where(BillingPlan.active==True).order_by(BillingPlan.amount_paise)).all();payments=db.scalars(select(PaymentRequest).where(PaymentRequest.user_id==u.id).order_by(PaymentRequest.submitted_at.desc()).limit(50)).all();subscription=db.scalar(select(Subscription).where(Subscription.user_id==u.id,Subscription.active==True).order_by(Subscription.ends_at.desc()).limit(1));invoices=db.scalars(select(BillingInvoice).where(BillingInvoice.user_id==u.id).order_by(BillingInvoice.issued_at.desc()).limit(30)).all();return templates.TemplateResponse(request,'store.html',ctx(request,u,plans=plans,payments=payments,subscription=subscription,invoices=invoices,billing_enabled=s.billing_enabled and bool(s.billing_upi_id),payee=s.billing_payee_name,currency=s.billing_currency))
+@app.get('/billing/qr/{plan_id}')
+def billing_qr(plan_id:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    if not s.billing_enabled or not re.fullmatch(r'[A-Za-z0-9._-]{2,}@[A-Za-z0-9.-]{2,}',s.billing_upi_id):raise HTTPException(404)
+    plan=db.get(BillingPlan,plan_id)
+    if not plan or not plan.active:raise HTTPException(404)
+    params={'pa':s.billing_upi_id,'pn':s.billing_payee_name,'am':f'{plan.amount_paise/100:.2f}','cu':s.billing_currency,'tn':f'{s.billing_payee_name} {plan.name}'};uri='upi://pay?'+urlencode(params);image=qrcode.make(uri);output=io.BytesIO();image.save(output,format='PNG');return Response(output.getvalue(),media_type='image/png',headers={'Cache-Control':'private, max-age=300'})
+@app.post('/billing/payments')
+async def submit_payment(request:Request,plan_id:int=Form(...),transaction_reference:str=Form(...),proof:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if not s.billing_enabled or not s.billing_upi_id:raise HTTPException(503,'Manual UPI billing is not configured')
+    plan=db.get(BillingPlan,plan_id);reference=transaction_reference.strip().upper()
+    if not plan or not plan.active:raise HTTPException(404,'Plan not found')
+    if not re.fullmatch(r'[A-Z0-9_-]{6,100}',reference):raise HTTPException(400,'Invalid UPI transaction reference')
+    if db.scalar(select(PaymentRequest).where(PaymentRequest.transaction_reference==reference)):raise HTTPException(409,'Transaction reference already submitted')
+    if db.scalar(select(PaymentRequest).where(PaymentRequest.user_id==u.id,PaymentRequest.status=='pending')):raise HTTPException(409,'You already have a payment awaiting review')
+    raw=await proof.read(s.payment_proof_max_mb*1024*1024+1)
+    if len(raw)>s.payment_proof_max_mb*1024*1024:raise HTTPException(413,'Payment proof is too large')
+    content_type=(proof.content_type or '').lower();allowed={'image/png','image/jpeg','image/webp','application/pdf'}
+    if content_type not in allowed:raise HTTPException(400,'Proof must be PNG, JPEG, WebP or PDF')
+    if content_type.startswith('image/'):
+        try:image=Image.open(io.BytesIO(raw));image.verify()
+        except (UnidentifiedImageError,OSError):raise HTTPException(400,'Invalid payment proof image')
+    elif not raw.startswith(b'%PDF-'):raise HTTPException(400,'Invalid PDF proof')
+    payment=PaymentRequest(user_id=u.id,plan_id=plan.id,transaction_reference=reference,amount_paise=plan.amount_paise,currency=s.billing_currency,status='pending');db.add(payment);db.flush();filename=re.sub(r'[^A-Za-z0-9_.-]','_',proof.filename or 'proof');db.add(PaymentProof(payment_id=payment.id,filename=filename[:160],content_type=content_type,sha256=hashlib.sha256(raw).hexdigest(),size=len(raw),data=raw));audit(db,u,'billing.payment_submit',f'payment:{payment.id}',request.client.host if request.client else '',{'plan':plan.code,'reference_suffix':reference[-4:]});emit(db,u.id,'billing.payment_submitted','Payment submitted',f'Your payment for {plan.name} is awaiting administrator verification.');db.commit();return RedirectResponse('/store',303)
+@app.get('/billing/invoices/{invoice_id}',response_class=HTMLResponse)
+def billing_invoice(invoice_id:int,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    invoice=db.get(BillingInvoice,invoice_id)
+    if not invoice or (invoice.user_id!=u.id and u.role not in {Role.admin,Role.owner}):raise HTTPException(404)
+    return templates.TemplateResponse(request,'invoice.html',ctx(request,u,invoice=invoice))
 @app.post('/store/request')
 def request_plan(request:Request,plan:str=Form(...),message:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
-    if plan not in {'Premium','Admin'}:raise HTTPException(400,'Invalid plan')
-    db.add(SupportTicket(user_id=u.id,category='billing',subject=f'{plan} plan request',message=message[:2000] or f'Please review my {plan} upgrade request.'));audit(db,u,'plan.request','billing',request.client.host if request.client else '',{'plan':plan});emit(db,u.id,'billing.plan_requested',f'{plan} plan requested','Your manual plan request was submitted for administrator review.');db.commit();return RedirectResponse('/support',303)
+    db.add(SupportTicket(user_id=u.id,category='billing',subject=f'{plan[:80]} plan request',message=message[:2000] or f'Please review my {plan[:80]} upgrade request.'));audit(db,u,'plan.request','billing',request.client.host if request.client else '',{'plan':plan[:80]});emit(db,u.id,'billing.plan_requested',f'{plan[:80]} plan requested','Your manual plan request was submitted for administrator review.');db.commit();return RedirectResponse('/support',303)
 @app.get('/support',response_class=HTMLResponse)
 def support(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     tickets=db.scalars(select(SupportTicket).where(SupportTicket.user_id==u.id).order_by(SupportTicket.created_at.desc())).all();return templates.TemplateResponse(request,'support.html',ctx(request,u,tickets=tickets))
@@ -882,6 +918,39 @@ def reset_branding(request:Request,u:User=Depends(current),_=Depends(csrf),db:Se
     for row in db.scalars(select(PlatformSetting).where(PlatformSetting.key.like('brand.%'))).all():db.delete(row)
     for asset in db.scalars(select(BrandAsset)).all():db.delete(asset)
     audit(db,u,'branding.reset','platform',request.client.host if request.client else '');db.commit();invalidate_brand();return RedirectResponse('/admin/branding',303)
+@app.get('/admin/billing/payments/{payment_id}/proof')
+def admin_payment_proof(payment_id:int,u:User=Depends(current),db:Session=Depends(get_db)):
+    if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
+    proof=db.scalar(select(PaymentProof).where(PaymentProof.payment_id==payment_id))
+    if not proof:raise HTTPException(404)
+    return Response(proof.data,media_type=proof.content_type,headers={'Content-Disposition':f'inline; filename="{proof.filename}"','Cache-Control':'no-store'})
+@app.post('/admin/billing/payments/{payment_id}/approve')
+def approve_payment(payment_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
+    payment=db.get(PaymentRequest,payment_id)
+    if not payment or payment.status!='pending':raise HTTPException(409,'Payment is not pending')
+    plan=db.get(BillingPlan,payment.plan_id);customer=db.get(User,payment.user_id)
+    if not plan or plan.grants_role not in {'user','premium'}:raise HTTPException(400,'Plan cannot be activated automatically')
+    now=datetime.now(timezone.utc);current=db.scalar(select(Subscription).where(Subscription.user_id==customer.id,Subscription.active==True).order_by(Subscription.ends_at.desc()).limit(1));base=now
+    if current:
+        current_end=current.ends_at if current.ends_at.tzinfo else current.ends_at.replace(tzinfo=timezone.utc);base=max(now,current_end);current.active=False
+    subscription=Subscription(user_id=customer.id,plan_id=plan.id,payment_id=payment.id,starts_at=now,ends_at=base+timedelta(days=plan.duration_days),active=True);db.add(subscription);old_role=customer.role;customer.role=Role(plan.grants_role);payment.status='approved';payment.reviewed_at=now;payment.reviewed_by=u.id;invoice=BillingInvoice(invoice_number=f'BLZ-{now.year}-{payment.id:06d}',user_id=customer.id,payment_id=payment.id,plan_name=plan.name,amount_paise=payment.amount_paise,currency=payment.currency);db.add(invoice)
+    if old_role!=customer.role:db.add(PlanEvent(user_id=customer.id,old_plan=old_role.value,new_plan=customer.role.value,changed_by=u.id))
+    audit(db,u,'billing.payment_approve',f'payment:{payment.id}',request.client.host if request.client else '',{'plan':plan.code});emit(db,customer.id,'billing.payment_approved','Payment approved',f'{plan.name} is active until {subscription.ends_at.date().isoformat()}.');db.commit();return RedirectResponse('/admin/billing',303)
+@app.post('/admin/billing/payments/{payment_id}/reject')
+def reject_payment(payment_id:int,request:Request,reason:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
+    payment=db.get(PaymentRequest,payment_id)
+    if not payment or payment.status!='pending':raise HTTPException(409,'Payment is not pending')
+    if len(reason.strip())<5:raise HTTPException(400,'Rejection reason is required')
+    payment.status='rejected';payment.reviewed_at=datetime.now(timezone.utc);payment.reviewed_by=u.id;payment.rejection_reason=reason.strip()[:1000];audit(db,u,'billing.payment_reject',f'payment:{payment.id}',request.client.host if request.client else '',{});emit(db,payment.user_id,'billing.payment_rejected','Payment needs attention',payment.rejection_reason);db.commit();return RedirectResponse('/admin/billing',303)
+@app.post('/admin/billing/plans')
+def create_billing_plan(request:Request,code:str=Form(...),name:str=Form(...),description:str=Form(...),amount_rupees:int=Form(...),duration_days:int=Form(...),featured:bool=Form(False),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role!=Role.owner:raise HTTPException(403)
+    code=code.strip().lower()
+    if not re.fullmatch(r'[a-z0-9-]{3,40}',code) or db.scalar(select(BillingPlan).where(BillingPlan.code==code)):raise HTTPException(409,'Invalid or duplicate plan code')
+    if not 1<=amount_rupees<=100000 or not 1<=duration_days<=3650:raise HTTPException(400,'Invalid plan amount or duration')
+    db.add(BillingPlan(code=code,name=name.strip()[:100],description=description.strip()[:2000],amount_paise=amount_rupees*100,duration_days=duration_days,grants_role='premium',featured=featured));audit(db,u,'billing.plan_create','billing',request.client.host if request.client else '',{'code':code});db.commit();return RedirectResponse('/admin/billing',303)
 @app.post('/admin/deliveries/{delivery_id}/retry')
 def retry_delivery(delivery_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
@@ -902,15 +971,16 @@ def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
 @app.get('/admin/{section}',response_class=HTMLResponse)
 def admin_section(section:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
-    allowed={'users','tickets','announcements','incidents','audit','operations','bot','deliveries','branding'}
+    allowed={'users','tickets','announcements','incidents','audit','operations','bot','deliveries','branding','billing'}
     if section not in allowed:raise HTTPException(404)
-    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'delivery_rows':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'object_storage_configured':storage.configured,'brand_settings':get_brand(),'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
+    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'delivery_rows':[],'billing_plans':[],'payment_rows':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'object_storage_configured':storage.configured,'brand_settings':get_brand(),'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
     if section=='users':data['users']=db.scalars(select(User).order_by(User.created_at.desc()).limit(500)).all()
     elif section=='tickets':data['tickets']=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(300)).all()
     elif section=='announcements':data['announcements']=db.scalars(select(Announcement).order_by(Announcement.created_at.desc()).limit(200)).all()
     elif section=='incidents':data['incidents']=db.scalars(select(Incident).order_by(Incident.created_at.desc()).limit(200)).all()
     elif section=='audit':data['audits']=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(500)).all()
     elif section=='deliveries':data['delivery_rows']=db.scalars(select(DeliveryOutbox).order_by(DeliveryOutbox.created_at.desc()).limit(500)).all()
+    elif section=='billing':ensure_default_billing_plans(db);data['billing_plans']=db.scalars(select(BillingPlan).order_by(BillingPlan.amount_paise)).all();data['payment_rows']=db.scalars(select(PaymentRequest).order_by(PaymentRequest.submitted_at.desc()).limit(300)).all()
     return templates.TemplateResponse(request,'admin_section.html',ctx(request,u,**data))
 @app.post('/admin/users/{uid}')
 def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(False),quota_value:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):

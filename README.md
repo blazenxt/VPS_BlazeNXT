@@ -332,7 +332,27 @@ GITHUB_CLIENT_SECRET=YOUR_GITHUB_CLIENT_SECRET
 
 ---
 
-## 11. Optional email and magic links
+## 11. Optional manual UPI billing
+
+BlazeNXT v1.0.0 supports manual verified UPI payments without Razorpay or Stripe.
+
+Railway variables:
+
+```env
+BILLING_ENABLED=true
+BILLING_UPI_ID=merchant@upi
+BILLING_PAYEE_NAME=Your Hosting Brand
+BILLING_CURRENCY=INR
+PAYMENT_PROOF_MAX_MB=2
+```
+
+Users select a plan at `/store`, scan the generated UPI QR, submit the UTR/reference and upload PNG/JPEG/WebP/PDF proof. Administrators must verify settlement in their UPI/bank account before approval at `/admin/billing`. Approval activates the subscription, changes the user plan and issues an internal invoice. Rejected payments include a reason. Expired subscriptions automatically return Premium users to the free role.
+
+A screenshot alone is never proof of settlement. Always verify the UTR, amount and receiving account independently.
+
+---
+
+## 12. Optional email and magic links
 
 Configure SMTP:
 
@@ -387,7 +407,7 @@ Admin delivery queue:
 
 ---
 
-## 12. Optional S3/R2 offsite backups
+## 13. Optional S3/R2 offsite backups
 
 Cloudflare R2 example:
 
@@ -412,7 +432,7 @@ Storage health:
 
 ---
 
-## 13. Optional iframe configuration
+## 14. Optional iframe configuration
 
 Default behavior blocks third-party embedding.
 
@@ -434,7 +454,7 @@ Never use `*` in production.
 
 ---
 
-## 14. Deploy and verify
+## 15. Deploy and verify
 
 Redeploy the BlazeNXT service after adding variables.
 
@@ -489,7 +509,7 @@ Available settings include panel name, navigation tagline, landing headline/subt
 
 ---
 
-## 15. Upload a workload from the website
+## 16. Upload a workload from the website
 
 Recommended Python ZIP:
 
@@ -512,7 +532,7 @@ Do not include secrets in source files. Configure secrets from the workload’s 
 
 ---
 
-## 16. Upload and run from Telegram
+## 17. Upload and run from Telegram
 
 Send the bot:
 
@@ -550,7 +570,7 @@ Never send secrets through Telegram captions.
 
 ---
 
-## 17. Install as a mobile/desktop app
+## 18. Install as a mobile/desktop app
 
 BlazeNXT is an installable PWA.
 
@@ -566,7 +586,7 @@ Private pages and API responses are never cached offline.
 
 ---
 
-## 18. Recover failed provisioning
+## 19. Recover failed provisioning
 
 If a workload shows `failed`:
 
@@ -598,7 +618,7 @@ BlazeNXT v1.0.0 uses Alembic. The schema baseline is:
 The current v1.0.0 schema revision is:
 
 ```text
-0002_web_push
+0003_upi_billing
 ```
 
 On the first deployment of an existing pre-Alembic installation, startup creates missing current tables and stamps the current migration head without dropping data. New databases run the baseline and subsequent migrations normally. PostgreSQL replicas coordinate startup with an advisory migration lock. Destructive baseline downgrade is disabled.
@@ -641,7 +661,7 @@ Review generated migrations before deploying.
 
 ---
 
-## 19. Local development
+## 20. Local development
 
 ```bash
 cp .env.example .env
@@ -665,7 +685,7 @@ pytest -q
 
 ---
 
-## 20. Production security checklist
+## 21. Production security checklist
 
 - Use a unique 32-byte `APP_SECRET`
 - Rotate every token ever exposed publicly

@@ -165,6 +165,23 @@ class ObjectBackup(Base):
 class BackupPolicy(Base):
     __tablename__='backup_policies'
     id:Mapped[int]=mapped_column(primary_key=True); workload_id:Mapped[int]=mapped_column(ForeignKey('workloads.id',ondelete='CASCADE'),unique=True,index=True); enabled:Mapped[bool]=mapped_column(Boolean,default=False); interval_hours:Mapped[int]=mapped_column(Integer,default=24); retention_count:Mapped[int]=mapped_column(Integer,default=7); next_run:Mapped[datetime]=mapped_column(DateTime(timezone=True)); last_run:Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); last_error:Mapped[str|None]=mapped_column(Text); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+class BillingPlan(Base):
+    __tablename__='billing_plans'
+    id:Mapped[int]=mapped_column(primary_key=True); code:Mapped[str]=mapped_column(String(40),unique=True,index=True); name:Mapped[str]=mapped_column(String(100)); description:Mapped[str]=mapped_column(Text); amount_paise:Mapped[int]=mapped_column(Integer); duration_days:Mapped[int]=mapped_column(Integer); grants_role:Mapped[str]=mapped_column(String(20),default='premium'); active:Mapped[bool]=mapped_column(Boolean,default=True,index=True); featured:Mapped[bool]=mapped_column(Boolean,default=False); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+class PaymentRequest(Base):
+    __tablename__='payment_requests'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); plan_id:Mapped[int]=mapped_column(ForeignKey('billing_plans.id',ondelete='RESTRICT')); transaction_reference:Mapped[str]=mapped_column(String(100),unique=True,index=True); amount_paise:Mapped[int]=mapped_column(Integer); currency:Mapped[str]=mapped_column(String(8),default='INR'); status:Mapped[str]=mapped_column(String(20),default='pending',index=True); submitted_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); reviewed_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); reviewed_by:Mapped[int|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL')); rejection_reason:Mapped[str|None]=mapped_column(Text)
+    plan:Mapped[BillingPlan]=relationship()
+class PaymentProof(Base):
+    __tablename__='payment_proofs'
+    id:Mapped[int]=mapped_column(primary_key=True); payment_id:Mapped[int]=mapped_column(ForeignKey('payment_requests.id',ondelete='CASCADE'),unique=True,index=True); filename:Mapped[str]=mapped_column(String(160)); content_type:Mapped[str]=mapped_column(String(80)); sha256:Mapped[str]=mapped_column(String(64)); size:Mapped[int]=mapped_column(Integer); data:Mapped[bytes]=mapped_column(LargeBinary)
+class Subscription(Base):
+    __tablename__='subscriptions'
+    id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); plan_id:Mapped[int]=mapped_column(ForeignKey('billing_plans.id',ondelete='RESTRICT')); payment_id:Mapped[int]=mapped_column(ForeignKey('payment_requests.id',ondelete='RESTRICT'),unique=True); starts_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); ends_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),index=True); active:Mapped[bool]=mapped_column(Boolean,default=True,index=True)
+    plan:Mapped[BillingPlan]=relationship()
+class BillingInvoice(Base):
+    __tablename__='billing_invoices'
+    id:Mapped[int]=mapped_column(primary_key=True); invoice_number:Mapped[str]=mapped_column(String(40),unique=True,index=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True); payment_id:Mapped[int]=mapped_column(ForeignKey('payment_requests.id',ondelete='RESTRICT'),unique=True); plan_name:Mapped[str]=mapped_column(String(100)); amount_paise:Mapped[int]=mapped_column(Integer); currency:Mapped[str]=mapped_column(String(8),default='INR'); issued_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
 class SupportTicket(Base):
     __tablename__='support_tickets'
     id:Mapped[int]=mapped_column(primary_key=True); user_id:Mapped[int]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
