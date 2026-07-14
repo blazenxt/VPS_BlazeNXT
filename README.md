@@ -457,6 +457,16 @@ A new account without workloads is redirected to:
 
 The guided checklist verifies platform readiness, multiple login identities, TOTP 2FA, Telegram linking, notification preferences and the first workload. Existing users with workloads go directly to the dashboard. Users may skip the wizard and reopen it later from **Personal → Setup guide**.
 
+### Admin branding
+
+Owners can customize the panel from:
+
+```text
+/admin/branding
+```
+
+Available settings include panel name, navigation tagline, landing headline/subtitle, footer description, primary/accent colors and a custom PNG/JPEG/WebP logo. Uploaded logos are normalized to PNG and limited to 512×512. Use **Reset to defaults** to restore BlazeNXT branding.
+
 ---
 
 ## 15. Upload a workload from the website

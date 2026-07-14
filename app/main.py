@@ -7,16 +7,18 @@ from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Requ
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from PIL import Image,UnidentifiedImageError
 from prometheus_client import CONTENT_TYPE_LATEST,Counter,generate_latest
 from sqlalchemy import func,select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.api_v1 import router as api_v1_router
 from app.auth import login_response,providers as auth_providers,router as auth_router
+from app.branding import DEFAULTS as BRAND_DEFAULTS,get_brand,invalidate_brand
 from app.catalog import PRESETS
 from app.config import get_settings
 from app.db import Base,SessionLocal,engine,get_db
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BrandAsset,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.notifications import emit,process_outbox
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
@@ -102,6 +104,11 @@ app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.get('/service-worker.js',include_in_schema=False)
 def service_worker():
     return Response(Path('static/service-worker.js').read_text(),media_type='application/javascript',headers={'Service-Worker-Allowed':'/','Cache-Control':'no-cache, no-store, must-revalidate'})
+@app.get('/brand/logo',include_in_schema=False)
+def brand_logo(db:Session=Depends(get_db)):
+    asset=db.scalar(select(BrandAsset).order_by(BrandAsset.updated_at.desc()).limit(1))
+    if not asset:return RedirectResponse('/static/blazenxt-logo.png?v=2',307)
+    return Response(asset.data,media_type=asset.content_type,headers={'Cache-Control':'public, max-age=3600','ETag':asset.sha256})
 def safe_frame_origins(raw,allow_none=False):
     values=[]
     for item in raw.split(','):
@@ -142,7 +149,7 @@ def csrf(request:Request,token:str=Form(...)):
     p=getattr(request.state,'session',None) or read_session(request.cookies.get('blaze_session',''))
     if not p or not secrets.compare_digest(p.get('csrf',''),token):raise HTTPException(403,'Invalid CSRF token')
 def ctx(request,user=None,**extra):
-    p=read_session(request.cookies.get('blaze_session','')) or {};return {'request':request,'user':user,'csrf':p.get('csrf',''),'bot_username':s.bot_username,'bot_runtime':BOT_RUNTIME,'current_year':datetime.now(timezone.utc).year,**extra}
+    p=read_session(request.cookies.get('blaze_session','')) or {};return {'request':request,'user':user,'csrf':p.get('csrf',''),'bot_username':s.bot_username,'bot_runtime':BOT_RUNTIME,'current_year':datetime.now(timezone.utc).year,'brand':get_brand(),**extra}
 def platform_setting(db,key,default='true'):
     row=db.get(PlatformSetting,key);return row.value if row else default
 def deployments_enabled(db):return platform_setting(db,'deployments_enabled','true')=='true'
@@ -779,6 +786,32 @@ def audit_export(u:User=Depends(current),db:Session=Depends(get_db)):
     output=io.StringIO();writer=csv.writer(output);writer.writerow(['id','created_at','actor_id','action','target','ip','detail'])
     for row in db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(10000)).all():writer.writerow([row.id,row.created_at,row.actor_id,row.action,row.target,row.ip,row.detail])
     return Response(output.getvalue(),media_type='text/csv',headers={'Content-Disposition':'attachment; filename="blazenxt-audit.csv"'})
+@app.post('/admin/branding')
+def update_branding(request:Request,name:str=Form(...),tagline:str=Form(...),landing_kicker:str=Form(...),landing_title:str=Form(...),landing_accent:str=Form(...),landing_subtitle:str=Form(...),footer_text:str=Form(...),primary_color:str=Form(...),accent_color:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role!=Role.owner:raise HTTPException(403)
+    values={'name':name.strip(),'tagline':tagline.strip(),'landing_kicker':landing_kicker.strip(),'landing_title':landing_title.strip(),'landing_accent':landing_accent.strip(),'landing_subtitle':landing_subtitle.strip(),'footer_text':footer_text.strip(),'primary_color':primary_color.lower(),'accent_color':accent_color.lower()};limits={'name':40,'tagline':80,'landing_kicker':100,'landing_title':100,'landing_accent':100,'landing_subtitle':300,'footer_text':180}
+    if len(values['name'])<2 or any(not value for key,value in values.items() if key not in {'primary_color','accent_color'}):raise HTTPException(400,'Brand text fields cannot be empty')
+    if any(len(values[key])>limit for key,limit in limits.items()) or not re.fullmatch(r'#[0-9a-f]{6}',values['primary_color']) or not re.fullmatch(r'#[0-9a-f]{6}',values['accent_color']):raise HTTPException(400,'Invalid branding values')
+    for key,value in values.items():row=db.get(PlatformSetting,f'brand.{key}') or PlatformSetting(key=f'brand.{key}',value=value);db.add(row);row.value=value
+    audit(db,u,'branding.update','platform',request.client.host if request.client else '',{'name':values['name'],'primary':values['primary_color'],'accent':values['accent_color']});db.commit();invalidate_brand();return RedirectResponse('/admin/branding',303)
+@app.post('/admin/branding/logo')
+async def update_brand_logo(request:Request,file:UploadFile=File(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role!=Role.owner:raise HTTPException(403)
+    raw=await file.read(2*1024*1024+1)
+    if len(raw)>2*1024*1024:raise HTTPException(413,'Logo exceeds 2 MB')
+    try:
+        image=Image.open(io.BytesIO(raw));image.verify();image=Image.open(io.BytesIO(raw)).convert('RGBA');image.thumbnail((512,512),Image.Resampling.LANCZOS);output=io.BytesIO();image.save(output,format='PNG',optimize=True);data=output.getvalue()
+    except (UnidentifiedImageError,OSError):raise HTTPException(400,'Upload a valid PNG, JPEG or WebP image')
+    asset=db.scalar(select(BrandAsset).order_by(BrandAsset.updated_at.desc()).limit(1));sha=hashlib.sha256(data).hexdigest()
+    if not asset:asset=BrandAsset(filename='brand-logo.png',content_type='image/png',sha256=sha,data=data);db.add(asset)
+    else:asset.filename='brand-logo.png';asset.content_type='image/png';asset.sha256=sha;asset.data=data;asset.updated_at=datetime.now(timezone.utc)
+    audit(db,u,'branding.logo','platform',request.client.host if request.client else '',{'sha256':sha});db.commit();invalidate_brand();return RedirectResponse('/admin/branding',303)
+@app.post('/admin/branding/reset')
+def reset_branding(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+    if u.role!=Role.owner:raise HTTPException(403)
+    for row in db.scalars(select(PlatformSetting).where(PlatformSetting.key.like('brand.%'))).all():db.delete(row)
+    for asset in db.scalars(select(BrandAsset)).all():db.delete(asset)
+    audit(db,u,'branding.reset','platform',request.client.host if request.client else '');db.commit();invalidate_brand();return RedirectResponse('/admin/branding',303)
 @app.post('/admin/deliveries/{delivery_id}/retry')
 def retry_delivery(delivery_id:int,request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
@@ -799,9 +832,9 @@ def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
 @app.get('/admin/{section}',response_class=HTMLResponse)
 def admin_section(section:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
-    allowed={'users','tickets','announcements','incidents','audit','operations','bot','deliveries'}
+    allowed={'users','tickets','announcements','incidents','audit','operations','bot','deliveries','branding'}
     if section not in allowed:raise HTTPException(404)
-    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'delivery_rows':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'object_storage_configured':storage.configured,'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
+    data={'section':section,'users':[],'tickets':[],'announcements':[],'incidents':[],'audits':[],'delivery_rows':[],'deployments_enabled':deployments_enabled(db),'workload_count':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'global_limit':s.global_workload_limit,'processed_updates':db.scalar(select(func.count()).select_from(ProcessedTelegramUpdate).where(ProcessedTelegramUpdate.created_at>=datetime.now(timezone.utc)-timedelta(hours=24))) or 0,'object_storage_configured':storage.configured,'brand_settings':get_brand(),'telegram_users':db.scalar(select(func.count()).select_from(User).where(User.telegram_id>0)) or 0}
     if section=='users':data['users']=db.scalars(select(User).order_by(User.created_at.desc()).limit(500)).all()
     elif section=='tickets':data['tickets']=db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(300)).all()
     elif section=='announcements':data['announcements']=db.scalars(select(Announcement).order_by(Announcement.created_at.desc()).limit(200)).all()

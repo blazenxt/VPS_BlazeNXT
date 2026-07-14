@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse,RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from app.branding import get_brand
 from app.config import get_settings
 from app.db import get_db
 from app.models import ApiKey,AuditLog,AuthIdentity,AuthIdentityBlock,AuthTokenUse,OnboardingState,User,UserSecurity,UserSessionPolicy,Workload
@@ -118,7 +119,7 @@ def account_security(request:Request,db:Session=Depends(get_db)):
     user=db.get(User,int(session['uid']))
     if not user or user.banned:raise HTTPException(403)
     identities=db.scalars(select(AuthIdentity).where(AuthIdentity.user_id==user.id).order_by(AuthIdentity.created_at)).all();keys=db.scalars(select(ApiKey).where(ApiKey.user_id==user.id,ApiKey.revoked==False).order_by(ApiKey.created_at.desc())).all();security=db.scalar(select(UserSecurity).where(UserSecurity.user_id==user.id))
-    return templates.TemplateResponse('security.html',{'request':request,'user':user,'csrf':session['csrf'],'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False}),'identities':identities,'linked_providers':{i.provider for i in identities},'providers':providers(),'api_keys':keys,'two_factor':bool(security and security.enabled),'current_provider':session.get('provider','unknown')})
+    return templates.TemplateResponse('security.html',{'request':request,'user':user,'csrf':session['csrf'],'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False}),'brand':get_brand(),'identities':identities,'linked_providers':{i.provider for i in identities},'providers':providers(),'api_keys':keys,'two_factor':bool(security and security.enabled),'current_provider':session.get('provider','unknown')})
 @router.post('/account/identities/{identity_id}/unlink')
 def unlink_identity(identity_id:int,request:Request,confirmation:str=Form(...),code:str=Form(''),token:str=Form(...),db:Session=Depends(get_db)):
     session=session_data(request,db)
@@ -165,7 +166,7 @@ def setup_2fa(request:Request,db:Session=Depends(get_db)):
     if row:row.encrypted_totp_secret=encrypt_secret(secret);row.encrypted_recovery_codes=encrypt_secret(json.dumps(hashed))
     else:db.add(UserSecurity(user_id=uid,encrypted_totp_secret=encrypt_secret(secret),encrypted_recovery_codes=encrypt_secret(json.dumps(hashed))))
     db.commit();user=db.get(User,uid);uri=pyotp.TOTP(secret).provisioning_uri(name=user.display_name,issuer_name='BlazeNXT v1')
-    return templates.TemplateResponse('two_factor_setup.html',{'request':request,'user':user,'csrf':session['csrf'],'secret':secret,'uri':uri,'recovery_codes':codes,'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False})})
+    return templates.TemplateResponse('two_factor_setup.html',{'request':request,'user':user,'csrf':session['csrf'],'secret':secret,'uri':uri,'recovery_codes':codes,'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False}),'brand':get_brand()})
 @router.post('/account/2fa/enable')
 def enable_2fa(request:Request,code:str=Form(...),token:str=Form(...),db:Session=Depends(get_db)):
     session=session_data(request,db)

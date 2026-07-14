@@ -122,6 +122,9 @@ class WorkloadDomain(Base):
 class PlatformSetting(Base):
     __tablename__='platform_settings'
     key:Mapped[str]=mapped_column(String(80),primary_key=True); value:Mapped[str]=mapped_column(Text); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
+class BrandAsset(Base):
+    __tablename__='brand_assets'
+    id:Mapped[int]=mapped_column(primary_key=True); filename:Mapped[str]=mapped_column(String(160)); content_type:Mapped[str]=mapped_column(String(80)); sha256:Mapped[str]=mapped_column(String(64)); data:Mapped[bytes]=mapped_column(LargeBinary); updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
 class Incident(Base):
     __tablename__='incidents'
     id:Mapped[int]=mapped_column(primary_key=True); title:Mapped[str]=mapped_column(String(160)); message:Mapped[str]=mapped_column(Text); status:Mapped[str]=mapped_column(String(30),default='investigating'); impact:Mapped[str]=mapped_column(String(20),default='minor'); created_by:Mapped[int|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL')); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True); resolved_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
