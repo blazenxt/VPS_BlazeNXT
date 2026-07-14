@@ -154,7 +154,8 @@ def public_status(request:Request,db:Session=Depends(get_db)):
 def public_status_api(db:Session=Depends(get_db)):
     total=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;online=db.scalar(select(func.count()).select_from(Workload).where(Workload.state==State.running)) or 0;active=db.scalar(select(func.count()).select_from(Incident).where(Incident.status!='resolved')) or 0;return {'status':'operational' if active==0 else 'degraded','services':{'total':total,'online':online},'active_incidents':active,'telegram_online':BOT_RUNTIME['online']}
 @app.get('/',response_class=HTMLResponse)
-def home(request:Request):return templates.TemplateResponse('home.html',ctx(request,auth_providers=auth_providers()))
+def home(request:Request,db:Session=Depends(get_db)):
+    announcements=db.scalars(select(Announcement).where(Announcement.active==True).order_by(Announcement.created_at.desc()).limit(3)).all();return templates.TemplateResponse('home.html',ctx(request,auth_providers=auth_providers(),announcements=announcements))
 @app.get('/auth/telegram')
 def auth(request:Request,db:Session=Depends(get_db)):
     data=dict(request.query_params)
