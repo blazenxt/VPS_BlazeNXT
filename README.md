@@ -119,6 +119,8 @@ Open the BlazeNXT service → **Variables** and add:
 
 ```env
 APP_ENV=production
+MIGRATIONS_ENABLED=true
+JSON_LOGS=true
 APP_SECRET=REPLACE_WITH_64_CHARACTER_HEX_SECRET
 WEB_BASE_URL=https://YOUR-HOST
 
@@ -564,6 +566,36 @@ service creation
 environment synchronization
 deployment trigger
 ```
+
+---
+
+## Database migrations and production diagnostics
+
+BlazeNXT v1.0.0 uses Alembic. On the first deployment of an existing pre-Alembic installation, startup creates any missing current tables and stamps revision:
+
+```text
+0001_blazenxt_v1
+```
+
+New databases run the baseline migration normally. PostgreSQL replicas coordinate startup with an advisory migration lock. Destructive baseline downgrade is disabled.
+
+Useful diagnostics:
+
+```text
+/health/ready       database revision and migration state
+X-Request-ID        unique ID returned on every dynamic response
+```
+
+Production logs are structured JSON when `JSON_LOGS=true` and include method, path, status, duration, client IP and request ID. HTML errors show a safe error page; API errors remain JSON.
+
+Create future migrations with:
+
+```bash
+alembic revision --autogenerate -m "describe change"
+alembic upgrade head
+```
+
+Review generated migrations before deploying.
 
 ---
 

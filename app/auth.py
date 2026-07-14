@@ -102,7 +102,7 @@ async def email_start(request:Request,email:str=Form(...),token:str=Form(''),db:
         link_uid=session.get('uid')
     signed=sign_magic_link(email,link_uid,session.get('csrf') if session else None);link=f"{s.web_base_url.rstrip('/')}/auth/email/verify?token={signed}"
     await asyncio.to_thread(send_magic_email,email,link)
-    return templates.TemplateResponse('magic_sent.html',{'request':request,'email_hint':email[:2]+'***@'+email.split('@')[1]})
+    return templates.TemplateResponse(request,'magic_sent.html',{'request':request,'email_hint':email[:2]+'***@'+email.split('@')[1]})
 @router.get('/auth/email/verify')
 def email_verify(request:Request,token:str,db:Session=Depends(get_db)):
     parsed=read_magic_link(token)
@@ -119,7 +119,7 @@ def account_security(request:Request,db:Session=Depends(get_db)):
     user=db.get(User,int(session['uid']))
     if not user or user.banned:raise HTTPException(403)
     identities=db.scalars(select(AuthIdentity).where(AuthIdentity.user_id==user.id).order_by(AuthIdentity.created_at)).all();keys=db.scalars(select(ApiKey).where(ApiKey.user_id==user.id,ApiKey.revoked==False).order_by(ApiKey.created_at.desc())).all();security=db.scalar(select(UserSecurity).where(UserSecurity.user_id==user.id))
-    return templates.TemplateResponse('security.html',{'request':request,'user':user,'csrf':session['csrf'],'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False}),'brand':get_brand(),'identities':identities,'linked_providers':{i.provider for i in identities},'providers':providers(),'api_keys':keys,'two_factor':bool(security and security.enabled),'current_provider':session.get('provider','unknown')})
+    return templates.TemplateResponse(request,'security.html',{'request':request,'user':user,'csrf':session['csrf'],'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False}),'brand':get_brand(),'identities':identities,'linked_providers':{i.provider for i in identities},'providers':providers(),'api_keys':keys,'two_factor':bool(security and security.enabled),'current_provider':session.get('provider','unknown')})
 @router.post('/account/identities/{identity_id}/unlink')
 def unlink_identity(identity_id:int,request:Request,confirmation:str=Form(...),code:str=Form(''),token:str=Form(...),db:Session=Depends(get_db)):
     session=session_data(request,db)
@@ -149,7 +149,7 @@ def create_api_key(request:Request,name:str=Form(...),scope_set:str=Form('read')
     scopes={'read':['servers:read'],'control':['servers:read','servers:control'],'full':['*']}.get(scope_set)
     if not scopes:raise HTTPException(400,'Invalid scope set')
     raw=f"blz_{secrets.token_urlsafe(8)}_{secrets.token_urlsafe(32)}";db.add(ApiKey(user_id=user.id,name=name[:80],prefix=raw[:16],key_hash=hash_token(raw),scopes=json.dumps(scopes)));db.commit()
-    return templates.TemplateResponse('api_key_created.html',{'request':request,'api_key':raw})
+    return templates.TemplateResponse(request,'api_key_created.html',{'request':request,'api_key':raw})
 @router.post('/account/api-keys/{key_id}/revoke')
 def revoke_api_key(key_id:int,request:Request,token:str=Form(...),db:Session=Depends(get_db)):
     session=session_data(request,db)
@@ -166,7 +166,7 @@ def setup_2fa(request:Request,db:Session=Depends(get_db)):
     if row:row.encrypted_totp_secret=encrypt_secret(secret);row.encrypted_recovery_codes=encrypt_secret(json.dumps(hashed))
     else:db.add(UserSecurity(user_id=uid,encrypted_totp_secret=encrypt_secret(secret),encrypted_recovery_codes=encrypt_secret(json.dumps(hashed))))
     db.commit();user=db.get(User,uid);uri=pyotp.TOTP(secret).provisioning_uri(name=user.display_name,issuer_name='BlazeNXT v1')
-    return templates.TemplateResponse('two_factor_setup.html',{'request':request,'user':user,'csrf':session['csrf'],'secret':secret,'uri':uri,'recovery_codes':codes,'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False}),'brand':get_brand()})
+    return templates.TemplateResponse(request,'two_factor_setup.html',{'request':request,'user':user,'csrf':session['csrf'],'secret':secret,'uri':uri,'recovery_codes':codes,'bot_username':s.bot_username,'bot_runtime':getattr(request.app.state,'bot_runtime',{'online':False}),'brand':get_brand()})
 @router.post('/account/2fa/enable')
 def enable_2fa(request:Request,code:str=Form(...),token:str=Form(...),db:Session=Depends(get_db)):
     session=session_data(request,db)
@@ -184,7 +184,7 @@ def disable_2fa(request:Request,code:str=Form(...),token:str=Form(...),db:Sessio
 @router.get('/auth/2fa',response_class=HTMLResponse)
 def two_factor_challenge(request:Request):
     if not read_preauth(request.cookies.get('blaze_preauth','')):return RedirectResponse('/',303)
-    return templates.TemplateResponse('two_factor_challenge.html',{'request':request})
+    return templates.TemplateResponse(request,'two_factor_challenge.html',{'request':request})
 @router.post('/auth/2fa')
 def verify_two_factor(request:Request,code:str=Form(...),db:Session=Depends(get_db)):
     preauth=read_preauth(request.cookies.get('blaze_preauth',''))

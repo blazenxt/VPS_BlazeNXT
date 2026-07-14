@@ -1,4 +1,4 @@
-import asyncio,csv,hashlib,io,json,logging,re,secrets,time,zipfile
+import asyncio,csv,hashlib,io,json,logging,re,secrets,time,uuid,zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime,timedelta,timezone
 from pathlib import Path,PurePosixPath
@@ -7,6 +7,8 @@ from fastapi import BackgroundTasks,Depends,FastAPI,File,Form,HTTPException,Requ
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.gzip import GZipMiddleware
 from PIL import Image,UnidentifiedImageError
 from prometheus_client import CONTENT_TYPE_LATEST,Counter,generate_latest
 from sqlalchemy import func,select
@@ -17,7 +19,9 @@ from app.auth import login_response,providers as auth_providers,router as auth_r
 from app.branding import DEFAULTS as BRAND_DEFAULTS,get_brand,invalidate_brand
 from app.catalog import PRESETS
 from app.config import get_settings
-from app.db import Base,SessionLocal,engine,get_db
+from app.db import SessionLocal,get_db
+from app.logging_config import configure_logging
+from app.migrations import MIGRATION_STATUS,run_migrations
 from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BrandAsset,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.notifications import emit,process_outbox
 from app.railway import RailwayClient
@@ -25,7 +29,7 @@ from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe
 from app.services import audit,perform_action,provision,quota,refresh_artifact
 from app.storage import ObjectStorageError,storage
 from app.webhooks import dispatch_event,validate_webhook_url
-s=get_settings();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');APP_STARTED=datetime.now(timezone.utc);TELEGRAM_HEADER_SECRET=hashlib.sha256((s.app_secret+s.telegram_webhook_secret).encode()).hexdigest();BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None,'last_checked_at':None,'pending_updates':0,'last_telegram_error':None,'auto_repaired':False}
+s=get_settings();configure_logging();templates=Jinja2Templates(directory='templates');REQ=Counter('blaze_http_requests_total','HTTP requests',['method','path','status']);rate={};logger=logging.getLogger('blazenxt');APP_STARTED=datetime.now(timezone.utc);TELEGRAM_HEADER_SECRET=hashlib.sha256((s.app_secret+s.telegram_webhook_secret).encode()).hexdigest();BOT_RUNTIME={'online':False,'username':None,'id':None,'webhook':None,'error':None,'started_at':None,'last_checked_at':None,'pending_updates':0,'last_telegram_error':None,'auto_repaired':False}
 async def configure_telegram_webhook():
     import httpx
     webhook=f"{s.web_base_url.rstrip('/')}/telegram/webhook/{s.telegram_webhook_secret}"
@@ -89,7 +93,7 @@ async def schedule_worker():
         except Exception:logger.exception('Schedule worker failed')
 @asynccontextmanager
 async def lifespan(app):
-    Base.metadata.create_all(engine)
+    await asyncio.to_thread(run_migrations);configure_logging()
     if s.production and ('change-me' in s.app_secret or not s.bot_token):raise RuntimeError('Production secrets are not configured')
     if s.bot_token and s.web_base_url.startswith('https://') and s.telegram_webhook_secret!='change-me':
         try:await configure_telegram_webhook()
@@ -99,7 +103,7 @@ async def lifespan(app):
     yield
     scheduler.cancel()
     if bot_monitor:bot_monitor.cancel()
-app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router);app.include_router(api_v1_router)
+app=FastAPI(title='BlazeNXT Control Plane',version='1.0.0',docs_url=None if s.production else '/docs',lifespan=lifespan);app.state.bot_runtime=BOT_RUNTIME;app.include_router(auth_router);app.include_router(api_v1_router);app.add_middleware(GZipMiddleware,minimum_size=1000)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 @app.get('/service-worker.js',include_in_schema=False)
 def service_worker():
@@ -123,8 +127,10 @@ FRAME_ANCESTORS=safe_frame_origins(s.frame_ancestors,True) or ["'none'"]
 FRAME_SOURCES=safe_frame_origins(s.frame_sources) or ['https://oauth.telegram.org']
 @app.middleware('http')
 async def security_headers(request,call_next):
+    started=time.perf_counter();incoming_id=request.headers.get('X-Request-ID','');request_id=incoming_id if re.fullmatch(r'[A-Za-z0-9_-]{1,64}',incoming_id) else uuid.uuid4().hex;request.state.request_id=request_id
     ip=request.client.host if request.client else 'unknown';key=f'{ip}:{request.url.path}';now=time.time();hits=[x for x in rate.get(key,[]) if now-x<60];limit=20 if request.url.path.startswith(('/auth','/api')) else 120
-    if len(hits)>=limit:return JSONResponse({'detail':'rate limit exceeded'},429)
+    if len(hits)>=limit:
+        response=JSONResponse({'detail':'rate limit exceeded','request_id':request_id},429);response.headers['X-Request-ID']=request_id;logger.warning('rate limit exceeded',extra={'request_id':request_id,'method':request.method,'path':request.url.path,'status':429,'client_ip':ip});return response
     hits.append(now);rate[key]=hits;response=await call_next(request)
     if response.headers.get('content-type','').startswith('text/html'):
         response.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0';response.headers['Pragma']='no-cache';response.headers['Expires']='0'
@@ -132,8 +138,29 @@ async def security_headers(request,call_next):
     headers={'X-Content-Type-Options':'nosniff','Referrer-Policy':'strict-origin-when-cross-origin','Permissions-Policy':'camera=(), microphone=(), geolocation=()','Content-Security-Policy':csp,'Strict-Transport-Security':'max-age=31536000; includeSubDomains'}
     if FRAME_ANCESTORS==["'none'"]:headers['X-Frame-Options']='DENY'
     elif FRAME_ANCESTORS==["'self'"]:headers['X-Frame-Options']='SAMEORIGIN'
-    response.headers.update(headers)
-    REQ.labels(request.method,request.url.path,response.status_code).inc();return response
+    response.headers.update(headers);response.headers['X-Request-ID']=request_id
+    if request.url.path.startswith('/static/'):response.headers['Cache-Control']='public, max-age=86400'
+    duration=round((time.perf_counter()-started)*1000,2);REQ.labels(request.method,request.url.path,response.status_code).inc()
+    if not request.url.path.startswith(('/static/','/health/')):logger.info('http request',extra={'request_id':request_id,'method':request.method,'path':request.url.path,'status':response.status_code,'duration_ms':duration,'client_ip':ip})
+    return response
+def wants_json(request):return request.url.path.startswith(('/api/','/health/','/telegram/','/internal/')) or 'application/json' in request.headers.get('accept','')
+def error_user(request):
+    try:
+        payload=read_session(request.cookies.get('blaze_session',''))
+        if payload:
+            with SessionLocal() as db:return db.get(User,int(payload['uid']))
+    except Exception:pass
+    return None
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request:Request,exc:StarletteHTTPException):
+    request_id=getattr(request.state,'request_id',uuid.uuid4().hex);detail=str(exc.detail)
+    if wants_json(request):return JSONResponse({'detail':detail,'request_id':request_id},status_code=exc.status_code,headers=getattr(exc,'headers',None))
+    return templates.TemplateResponse(request,'error.html',ctx(request,error_user(request),status_code=exc.status_code,error_title='Request could not be completed',error_message=detail,request_id=request_id),status_code=exc.status_code,headers=getattr(exc,'headers',None))
+@app.exception_handler(Exception)
+async def unhandled_error(request:Request,exc:Exception):
+    request_id=getattr(request.state,'request_id',uuid.uuid4().hex);logger.exception('unhandled request error',extra={'request_id':request_id,'method':request.method,'path':request.url.path,'status':500,'client_ip':request.client.host if request.client else 'unknown'})
+    if wants_json(request):return JSONResponse({'detail':'Internal server error','request_id':request_id},status_code=500)
+    return templates.TemplateResponse(request,'error.html',ctx(request,error_user(request),status_code=500,error_title='Something went wrong',error_message='The error was recorded. Use the request ID when contacting support.',request_id=request_id),status_code=500)
 def current(request:Request,db:Session=Depends(get_db)):
     p=read_session(request.cookies.get('blaze_session',''))
     if not p:raise HTTPException(401,'Sign in required')
@@ -156,13 +183,13 @@ def deployments_enabled(db):return platform_setting(db,'deployments_enabled','tr
 @app.get('/status',response_class=HTMLResponse)
 def public_status(request:Request,db:Session=Depends(get_db)):
     incidents=db.scalars(select(Incident).order_by(Incident.created_at.desc()).limit(25)).all();announcements=db.scalars(select(Announcement).where(Announcement.active==True).order_by(Announcement.created_at.desc()).limit(5)).all();total=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;online=db.scalar(select(func.count()).select_from(Workload).where(Workload.state==State.running)) or 0;failed=db.scalar(select(func.count()).select_from(Workload).where(Workload.state==State.failed)) or 0;since=datetime.now(timezone.utc)-timedelta(hours=24);snapshots=db.scalars(select(HealthSnapshot).where(HealthSnapshot.created_at>=since)).all();uptime=round(100*sum(x.state!='failed' for x in snapshots)/len(snapshots),2) if snapshots else (100 if failed==0 else 0);operational=BOT_RUNTIME['online'] and not any(x.status!='resolved' and x.impact in {'major','critical'} for x in incidents)
-    return templates.TemplateResponse('status.html',ctx(request,status_data={'operational':operational,'total':total,'online':online,'failed':failed,'uptime':uptime,'started_at':APP_STARTED},incidents=incidents,announcements=announcements))
+    return templates.TemplateResponse(request,'status.html',ctx(request,status_data={'operational':operational,'total':total,'online':online,'failed':failed,'uptime':uptime,'started_at':APP_STARTED},incidents=incidents,announcements=announcements))
 @app.get('/api/status')
 def public_status_api(db:Session=Depends(get_db)):
     total=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;online=db.scalar(select(func.count()).select_from(Workload).where(Workload.state==State.running)) or 0;active=db.scalar(select(func.count()).select_from(Incident).where(Incident.status!='resolved')) or 0;return {'status':'operational' if active==0 else 'degraded','services':{'total':total,'online':online},'active_incidents':active,'telegram_online':BOT_RUNTIME['online']}
 @app.get('/',response_class=HTMLResponse)
 def home(request:Request,db:Session=Depends(get_db)):
-    announcements=db.scalars(select(Announcement).where(Announcement.active==True).order_by(Announcement.created_at.desc()).limit(3)).all();return templates.TemplateResponse('home.html',ctx(request,auth_providers=auth_providers(),announcements=announcements))
+    announcements=db.scalars(select(Announcement).where(Announcement.active==True).order_by(Announcement.created_at.desc()).limit(3)).all();return templates.TemplateResponse(request,'home.html',ctx(request,auth_providers=auth_providers(),announcements=announcements))
 @app.get('/auth/telegram')
 def auth(request:Request,db:Session=Depends(get_db)):
     data=dict(request.query_params)
@@ -191,7 +218,7 @@ def onboarding_steps(db,u):
     return steps
 @app.get('/onboarding',response_class=HTMLResponse)
 def onboarding(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
-    steps=onboarding_steps(db,u);done=sum(x['done'] for x in steps);state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id));return templates.TemplateResponse('onboarding.html',ctx(request,u,steps=steps,done=done,total=len(steps),percent=round(done*100/len(steps)),state=state))
+    steps=onboarding_steps(db,u);done=sum(x['done'] for x in steps);state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id));return templates.TemplateResponse(request,'onboarding.html',ctx(request,u,steps=steps,done=done,total=len(steps),percent=round(done*100/len(steps)),state=state))
 @app.post('/onboarding/complete')
 def complete_onboarding(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     steps=onboarding_steps(db,u)
@@ -206,7 +233,7 @@ def dashboard(request:Request,u:User=Depends(current),db:Session=Depends(get_db)
     ws=db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared_ids)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
     notes=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(5)).all()
     global_active=db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0;visible_ids=[w.id for w in ws];allocations=db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(visible_ids))).all() if visible_ids else [];container_count=sum(x.replicas for x in allocations)+(len(ws)-len(allocations))
-    return templates.TemplateResponse('dashboard.html',ctx(request,u,workloads=ws,container_count=container_count,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS,onboarding_state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id)),onboarding_steps=onboarding_steps(db,u)))
+    return templates.TemplateResponse(request,'dashboard.html',ctx(request,u,workloads=ws,container_count=container_count,quota=quota(u),notifications=notes,global_active=global_active,global_limit=s.global_workload_limit,presets=PRESETS,onboarding_state=db.scalar(select(OnboardingState).where(OnboardingState.user_id==u.id)),onboarding_steps=onboarding_steps(db,u)))
 def configured_embed_tools():
     try:items=json.loads(s.embed_tools_json)
     except json.JSONDecodeError:return []
@@ -218,25 +245,25 @@ def configured_embed_tools():
     return tools
 @app.get('/tools',response_class=HTMLResponse)
 def embedded_tools(request:Request,u:User=Depends(current)):
-    return templates.TemplateResponse('tools.html',ctx(request,u,tools=configured_embed_tools()))
+    return templates.TemplateResponse(request,'tools.html',ctx(request,u,tools=configured_embed_tools()))
 def visible_workloads(db,u,scope='mine'):
     if scope=='all' and u.role in {Role.admin,Role.owner}:return db.scalars(select(Workload).where(Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
     shared=db.scalars(select(WorkloadMember.workload_id).where(WorkloadMember.user_id==u.id)).all();return db.scalars(select(Workload).where((Workload.user_id==u.id)|(Workload.id.in_(shared)),Workload.state!=State.deleted).order_by(Workload.created_at.desc())).all()
 @app.get('/project',response_class=HTMLResponse)
 def project_canvas(request:Request,scope:str='mine',u:User=Depends(current),db:Session=Depends(get_db)):
     workloads=visible_workloads(db,u,scope);ids=[w.id for w in workloads];allocations={x.workload_id:x for x in db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(ids))).all()} if ids else {};databases=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id.in_(ids))).all() if ids else [];domains=db.scalars(select(WorkloadDomain).where(WorkloadDomain.workload_id.in_(ids))).all() if ids else [];pending=db.scalar(select(func.count()).select_from(StagedChange).where(StagedChange.user_id==u.id,StagedChange.status=='pending')) or 0
-    return templates.TemplateResponse('project.html',ctx(request,u,workloads=workloads,allocations=allocations,databases=databases,domains=domains,scope=scope,pending=pending))
+    return templates.TemplateResponse(request,'project.html',ctx(request,u,workloads=workloads,allocations=allocations,databases=databases,domains=domains,scope=scope,pending=pending))
 @app.get('/observability',response_class=HTMLResponse)
 def observability(request:Request,scope:str='mine',u:User=Depends(current),db:Session=Depends(get_db)):
     workloads=visible_workloads(db,u,scope);ids=[w.id for w in workloads];allocations=db.scalars(select(WorkloadAllocation).where(WorkloadAllocation.workload_id.in_(ids))).all() if ids else [];events=db.scalars(select(AuditLog).where(AuditLog.target.in_([f'workload:{x}' for x in ids])).order_by(AuditLog.created_at.desc()).limit(100)).all() if ids else [];hooks=db.scalars(select(WorkloadWebhook.id).where(WorkloadWebhook.workload_id.in_(ids))).all() if ids else [];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hooks)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hooks else []
     stats={'total':len(workloads),'online':sum(w.state==State.running for w in workloads),'failed':sum(w.state==State.failed for w in workloads),'containers':sum(a.replicas for a in allocations)+(len(workloads)-len(allocations)),'memory_mb':sum(a.memory_mb*a.replicas for a in allocations),'cpu':sum(float(a.cpu_vcpus)*a.replicas for a in allocations)}
-    return templates.TemplateResponse('observability.html',ctx(request,u,workloads=workloads,events=events,deliveries=deliveries,stats=stats,scope=scope))
+    return templates.TemplateResponse(request,'observability.html',ctx(request,u,workloads=workloads,events=events,deliveries=deliveries,stats=stats,scope=scope))
 @app.get('/api/observability')
 def observability_api(scope:str='mine',u:User=Depends(current),db:Session=Depends(get_db)):
     rows=visible_workloads(db,u,scope);return {'services':[{'id':w.id,'name':w.name,'state':w.state.value,'updated_at':w.updated_at} for w in rows],'summary':{'total':len(rows),'online':sum(w.state==State.running for w in rows),'failed':sum(w.state==State.failed for w in rows)}}
 @app.get('/changes',response_class=HTMLResponse)
 def changes(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
-    rows=db.scalars(select(StagedChange).where(StagedChange.user_id==u.id,StagedChange.status=='pending').order_by(StagedChange.created_at.desc())).all();workloads=visible_workloads(db,u);return templates.TemplateResponse('changes.html',ctx(request,u,changes=rows,workloads=workloads,presets=PRESETS))
+    rows=db.scalars(select(StagedChange).where(StagedChange.user_id==u.id,StagedChange.status=='pending').order_by(StagedChange.created_at.desc())).all();workloads=visible_workloads(db,u);return templates.TemplateResponse(request,'changes.html',ctx(request,u,changes=rows,workloads=workloads,presets=PRESETS))
 @app.post('/changes')
 def stage_change(request:Request,workload_id:int=Form(...),kind:str=Form(...),runtime:str=Form(''),entrypoint:str=Form(''),cpu_vcpus:str=Form(''),memory_mb:str=Form(''),replicas:str=Form(''),restart_policy:str=Form('ON_FAILURE'),variable_name:str=Form(''),variable_value:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     w=accessible_workload(workload_id,u,db,'control');payload={}
@@ -415,7 +442,7 @@ async def server_detail(wid:int,request:Request,tab:str='console',u:User=Depends
     schedules=db.scalars(select(Schedule).where(Schedule.workload_id==wid).order_by(Schedule.created_at.desc())).all()
     allocation=db.scalar(select(WorkloadAllocation).where(WorkloadAllocation.workload_id==wid));databases=db.scalars(select(ManagedDatabase).where(ManagedDatabase.workload_id==wid).order_by(ManagedDatabase.created_at.desc())).all();domains=db.scalars(select(WorkloadDomain).where(WorkloadDomain.workload_id==wid).order_by(WorkloadDomain.created_at.desc())).all();webhooks=db.scalars(select(WorkloadWebhook).where(WorkloadWebhook.workload_id==wid).order_by(WorkloadWebhook.created_at.desc())).all();hook_ids=[x.id for x in webhooks];deliveries=db.scalars(select(WebhookDelivery).where(WebhookDelivery.webhook_id.in_(hook_ids)).order_by(WebhookDelivery.created_at.desc()).limit(50)).all() if hook_ids else []
     is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
-    return templates.TemplateResponse('server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,object_backups=object_backups,backup_policy=backup_policy,object_storage_configured=storage.configured,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning,allocation=allocation,databases=databases,domains=domains,active_database_count=sum(1 for d in databases if d.state=='active'),max_databases=s.max_databases_per_workload))
+    return templates.TemplateResponse(request,'server.html',ctx(request,u,w=w,tab=tab,deployments=deployments,provider_error=provider_error,files=artifact_files(w.artifact),events=events,variables=variables,backups=backups,object_backups=object_backups,backup_policy=backup_policy,object_storage_configured=storage.configured,members=members,schedules=schedules,is_owner=is_owner,presets=PRESETS,webhooks=webhooks,deliveries=deliveries,database_enabled=s.enable_database_provisioning,allocation=allocation,databases=databases,domains=domains,active_database_count=sum(1 for d in databases if d.state=='active'),max_databases=s.max_databases_per_workload))
 
 @app.get('/servers/{wid}/download')
 def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)):
@@ -425,7 +452,7 @@ def download_artifact(wid:int,u:User=Depends(current),db:Session=Depends(get_db)
 @app.get('/servers/{wid}/files/edit',response_class=HTMLResponse)
 def edit_file_page(wid:int,path:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     w=accessible_workload(wid,u,db,'files');content=read_artifact_text(w.artifact,path);is_owner=w.user_id==u.id or u.role in {Role.admin,Role.owner}
-    return templates.TemplateResponse('file_editor.html',ctx(request,u,w=w,path=clean_archive_path(path),content=content,is_owner=is_owner))
+    return templates.TemplateResponse(request,'file_editor.html',ctx(request,u,w=w,path=clean_archive_path(path),content=content,is_owner=is_owner))
 @app.post('/servers/{wid}/files/save')
 async def save_artifact_file(wid:int,request:Request,path:str=Form(...),content:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     w=owned_workload(wid,u,db);raw=content.encode()
@@ -679,14 +706,14 @@ async def rollback_deployment(wid:int,did:str,request:Request,u:User=Depends(cur
 @app.get('/store',response_class=HTMLResponse)
 def store(request:Request,u:User=Depends(current)):
     plans=[{'name':'Free','price':'₹0','slots':2,'features':['Telegram + web sync','Logs and controls','Manual backups']},{'name':'Premium','price':'Manual','slots':20,'features':['Schedules and variables','Collaborators','Priority support']},{'name':'Admin','price':'Private','slots':100,'features':['Platform operations','User management','Extended quotas']}]
-    return templates.TemplateResponse('store.html',ctx(request,u,plans=plans))
+    return templates.TemplateResponse(request,'store.html',ctx(request,u,plans=plans))
 @app.post('/store/request')
 def request_plan(request:Request,plan:str=Form(...),message:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if plan not in {'Premium','Admin'}:raise HTTPException(400,'Invalid plan')
     db.add(SupportTicket(user_id=u.id,category='billing',subject=f'{plan} plan request',message=message[:2000] or f'Please review my {plan} upgrade request.'));audit(db,u,'plan.request','billing',request.client.host if request.client else '',{'plan':plan});emit(db,u.id,'billing.plan_requested',f'{plan} plan requested','Your manual plan request was submitted for administrator review.');db.commit();return RedirectResponse('/support',303)
 @app.get('/support',response_class=HTMLResponse)
 def support(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
-    tickets=db.scalars(select(SupportTicket).where(SupportTicket.user_id==u.id).order_by(SupportTicket.created_at.desc())).all();return templates.TemplateResponse('support.html',ctx(request,u,tickets=tickets))
+    tickets=db.scalars(select(SupportTicket).where(SupportTicket.user_id==u.id).order_by(SupportTicket.created_at.desc())).all();return templates.TemplateResponse(request,'support.html',ctx(request,u,tickets=tickets))
 @app.post('/support')
 def create_ticket(request:Request,category:str=Form(...),subject:str=Form(...),message:str=Form(...),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if category not in {'technical','billing','abuse','feature'} or not 3<=len(subject)<=120 or not 10<=len(message)<=5000:raise HTTPException(400,'Invalid ticket')
@@ -721,7 +748,7 @@ async def telegram(secret:str,request:Request):
 def notification_settings(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     pref=db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==u.id))
     if not pref:pref=NotificationPreference(user_id=u.id);db.add(pref);db.commit();db.refresh(pref)
-    deliveries=db.scalars(select(DeliveryOutbox).where(DeliveryOutbox.user_id==u.id).order_by(DeliveryOutbox.created_at.desc()).limit(100)).all();emails=db.scalars(select(AuthIdentity.email).where(AuthIdentity.user_id==u.id,AuthIdentity.email.is_not(None))).all();categories=set(json.loads(pref.event_categories));return templates.TemplateResponse('notification_settings.html',ctx(request,u,pref=pref,categories=categories,deliveries=deliveries,has_email=bool(emails),smtp_configured=bool(s.smtp_host and s.smtp_from)))
+    deliveries=db.scalars(select(DeliveryOutbox).where(DeliveryOutbox.user_id==u.id).order_by(DeliveryOutbox.created_at.desc()).limit(100)).all();emails=db.scalars(select(AuthIdentity.email).where(AuthIdentity.user_id==u.id,AuthIdentity.email.is_not(None))).all();categories=set(json.loads(pref.event_categories));return templates.TemplateResponse(request,'notification_settings.html',ctx(request,u,pref=pref,categories=categories,deliveries=deliveries,has_email=bool(emails),smtp_configured=bool(s.smtp_host and s.smtp_from)))
 @app.post('/account/notifications')
 def update_notification_settings(request:Request,web_enabled:bool=Form(False),email_enabled:bool=Form(False),telegram_enabled:bool=Form(False),categories:list[str]=Form([]),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     allowed={'deployment','security','billing','support','incident'};selected=sorted(set(categories)&allowed);pref=db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==u.id))
@@ -732,7 +759,7 @@ def test_notification(request:Request,u:User=Depends(current),_=Depends(csrf),db
     emit(db,u.id,'security.test','Test notification','Your BlazeNXT notification automation is configured correctly.');db.commit();return RedirectResponse('/account/notifications',303)
 @app.get('/notifications',response_class=HTMLResponse)
 def notifications_page(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
-    rows=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(200)).all();return templates.TemplateResponse('notifications.html',ctx(request,u,notifications=rows))
+    rows=db.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(200)).all();return templates.TemplateResponse(request,'notifications.html',ctx(request,u,notifications=rows))
 @app.post('/notifications/read-all')
 def read_all_notifications(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     for row in db.scalars(select(Notification).where(Notification.user_id==u.id,Notification.read==False)).all():row.read=True
@@ -742,7 +769,7 @@ def account_portal(request:Request,u:User=Depends(current),db:Session=Depends(ge
     workloads=db.scalars(select(Workload).where(Workload.user_id==u.id,Workload.state!=State.deleted)).all();wallet=db.scalar(select(Wallet).where(Wallet.user_id==u.id))
     if not wallet:wallet=Wallet(user_id=u.id);db.add(wallet);db.commit()
     referral=db.scalar(select(ReferralCode).where(ReferralCode.user_id==u.id));identities=db.scalars(select(AuthIdentity).where(AuthIdentity.user_id==u.id)).all();security=db.scalar(select(ApiKey).where(ApiKey.user_id==u.id,ApiKey.revoked==False));plans=db.scalars(select(PlanEvent).where(PlanEvent.user_id==u.id).order_by(PlanEvent.created_at.desc()).limit(20)).all();key_ids=db.scalars(select(ApiKey.id).where(ApiKey.user_id==u.id)).all();api_logs=db.scalars(select(ApiRequestLog).where(ApiRequestLog.api_key_id.in_(key_ids)).order_by(ApiRequestLog.created_at.desc()).limit(20)).all() if key_ids else [];logins=db.scalars(select(AuditLog).where(AuditLog.actor_id==u.id,AuditLog.action=='login').order_by(AuditLog.created_at.desc()).limit(10)).all();onboarding={'identity':bool(identities),'deployment':bool(workloads),'security':bool(security),'telegram':u.telegram_id>0}
-    return templates.TemplateResponse('account.html',ctx(request,u,workloads=workloads,wallet=wallet,referral=referral,plans=plans,logins=logins,api_logs=api_logs,onboarding=onboarding))
+    return templates.TemplateResponse(request,'account.html',ctx(request,u,workloads=workloads,wallet=wallet,referral=referral,plans=plans,logins=logins,api_logs=api_logs,onboarding=onboarding))
 @app.post('/account/referral/create')
 def create_referral(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     row=db.scalar(select(ReferralCode).where(ReferralCode.user_id==u.id))
@@ -828,7 +855,7 @@ async def repair_bot(request:Request,u:User=Depends(current),_=Depends(csrf),db:
 def admin(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
     stats={'users':db.scalar(select(func.count()).select_from(User)) or 0,'workloads':db.scalar(select(func.count()).select_from(Workload).where(Workload.state!=State.deleted)) or 0,'tickets':db.scalar(select(func.count()).select_from(SupportTicket).where(SupportTicket.status.in_(['open','in_progress']))) or 0,'incidents':db.scalar(select(func.count()).select_from(Incident).where(Incident.status!='resolved')) or 0};recent=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(20)).all()
-    return templates.TemplateResponse('admin_overview.html',ctx(request,u,stats=stats,recent=recent,deployments_enabled=deployments_enabled(db)))
+    return templates.TemplateResponse(request,'admin_overview.html',ctx(request,u,stats=stats,recent=recent,deployments_enabled=deployments_enabled(db)))
 @app.get('/admin/{section}',response_class=HTMLResponse)
 def admin_section(section:str,request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     if u.role not in {Role.admin,Role.owner}:raise HTTPException(403)
@@ -841,7 +868,7 @@ def admin_section(section:str,request:Request,u:User=Depends(current),db:Session
     elif section=='incidents':data['incidents']=db.scalars(select(Incident).order_by(Incident.created_at.desc()).limit(200)).all()
     elif section=='audit':data['audits']=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(500)).all()
     elif section=='deliveries':data['delivery_rows']=db.scalars(select(DeliveryOutbox).order_by(DeliveryOutbox.created_at.desc()).limit(500)).all()
-    return templates.TemplateResponse('admin_section.html',ctx(request,u,**data))
+    return templates.TemplateResponse(request,'admin_section.html',ctx(request,u,**data))
 @app.post('/admin/users/{uid}')
 def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(False),quota_value:str=Form(''),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     if u.role!=Role.owner:raise HTTPException(403)
@@ -853,7 +880,10 @@ def update_user(uid:int,request:Request,role:str=Form(...),banned:bool=Form(Fals
 @app.get('/health/live')
 def live():return {'status':'ok'}
 @app.get('/health/ready')
-def ready(db:Session=Depends(get_db)):db.execute(select(1));return {'status':'ready','railway_configured':RailwayClient().configured,'telegram_online':BOT_RUNTIME['online']}
+def ready(db:Session=Depends(get_db)):
+    db.execute(select(1));ready_state=MIGRATION_STATUS['state'] in {'ready','disabled'}
+    if not ready_state:raise HTTPException(503,'Database migrations are not ready')
+    return {'status':'ready','railway_configured':RailwayClient().configured,'telegram_online':BOT_RUNTIME['online'],'database_revision':MIGRATION_STATUS['revision'],'migration_state':MIGRATION_STATUS['state']}
 @app.get('/health/bot')
 def bot_health():return {'online':BOT_RUNTIME['online'],'username':BOT_RUNTIME['username'],'started_at':BOT_RUNTIME['started_at'],'last_checked_at':BOT_RUNTIME['last_checked_at'],'pending_updates':BOT_RUNTIME['pending_updates'],'auto_repaired':BOT_RUNTIME['auto_repaired']}
 @app.get('/health/storage')

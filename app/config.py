@@ -5,6 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
     app_env: str = 'development'
+    migrations_enabled: bool = True
+    json_logs: bool = True
     app_secret: str = 'development-only-change-me-32-bytes'
     web_base_url: str = 'http://localhost:8080'
     database_url: str = 'sqlite:///./blaze.db'
