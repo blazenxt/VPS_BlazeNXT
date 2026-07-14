@@ -23,7 +23,7 @@ from app.config import get_settings
 from app.db import SessionLocal,get_db
 from app.logging_config import configure_logging
 from app.migrations import MIGRATION_STATUS,run_migrations
-from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BrandAsset,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
+from app.models import Announcement,ApiKey,ApiRequestLog,Artifact,AuditLog,AuthIdentity,AuthIdentityBlock,Backup,BrandAsset,BackupPolicy,DeliveryOutbox,HealthSnapshot,Incident,ManagedDatabase,Notification,NotificationPreference,ObjectBackup,OnboardingState,PlanEvent,PlatformSetting,ProcessedTelegramUpdate,PushSubscription,ReferralCode,ReferralRedemption,Role,RunnerToken,Schedule,StagedChange,State,SupportTicket,TelegramUploadDraft,User,UserSecurity,UserSessionPolicy,Wallet,WebhookDelivery,Workload,WorkloadAllocation,WorkloadDomain,WorkloadMember,WorkloadVariable,WorkloadWebhook
 from app.notifications import emit,process_outbox
 from app.railway import RailwayClient
 from app.security import encrypt_secret,hash_token,inspect_zip,read_session,safe_filename,verify_telegram
@@ -767,16 +767,36 @@ async def telegram(secret:str,request:Request):
         except IntegrityError:db.rollback();return {'ok':True,'duplicate':True}
     from app.telegram_bot import handle_update
     asyncio.create_task(handle_update(update));return {'ok':True}
+def verify_csrf_header(request):
+    payload=read_session(request.cookies.get('blaze_session',''));provided=request.headers.get('X-CSRF-Token','')
+    if not payload or not secrets.compare_digest(payload.get('csrf',''),provided):raise HTTPException(403,'Invalid CSRF token')
+@app.get('/api/push/config')
+def push_config(u:User=Depends(current)):
+    return {'enabled':bool(s.vapid_public_key and s.vapid_private_key),'public_key':s.vapid_public_key or None}
+@app.post('/api/push/subscribe')
+async def push_subscribe(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    verify_csrf_header(request);payload=await request.json();endpoint=str(payload.get('endpoint',''));keys=payload.get('keys') or {};p256dh=str(keys.get('p256dh',''));auth_key=str(keys.get('auth',''))
+    if len(endpoint)>2000 or not endpoint.startswith('https://') or not 20<=len(p256dh)<=500 or not 8<=len(auth_key)<=200:raise HTTPException(400,'Invalid push subscription')
+    row=db.scalar(select(PushSubscription).where(PushSubscription.endpoint==endpoint))
+    if row and row.user_id!=u.id:raise HTTPException(409,'Push subscription belongs to another account')
+    if not row:row=PushSubscription(user_id=u.id,endpoint=endpoint,p256dh=p256dh,auth=auth_key,user_agent=request.headers.get('user-agent','')[:300]);db.add(row)
+    else:row.p256dh=p256dh;row.auth=auth_key;row.enabled=True;row.user_agent=request.headers.get('user-agent','')[:300];row.last_error=None
+    db.commit();return {'ok':True}
+@app.post('/api/push/unsubscribe')
+async def push_unsubscribe(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
+    verify_csrf_header(request);payload=await request.json();endpoint=str(payload.get('endpoint',''));row=db.scalar(select(PushSubscription).where(PushSubscription.user_id==u.id,PushSubscription.endpoint==endpoint))
+    if row:row.enabled=False;db.commit()
+    return {'ok':True}
 @app.get('/account/notifications',response_class=HTMLResponse)
 def notification_settings(request:Request,u:User=Depends(current),db:Session=Depends(get_db)):
     pref=db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==u.id))
     if not pref:pref=NotificationPreference(user_id=u.id);db.add(pref);db.commit();db.refresh(pref)
-    deliveries=db.scalars(select(DeliveryOutbox).where(DeliveryOutbox.user_id==u.id).order_by(DeliveryOutbox.created_at.desc()).limit(100)).all();emails=db.scalars(select(AuthIdentity.email).where(AuthIdentity.user_id==u.id,AuthIdentity.email.is_not(None))).all();categories=set(json.loads(pref.event_categories));return templates.TemplateResponse(request,'notification_settings.html',ctx(request,u,pref=pref,categories=categories,deliveries=deliveries,has_email=bool(emails),smtp_configured=bool(s.smtp_host and s.smtp_from)))
+    deliveries=db.scalars(select(DeliveryOutbox).where(DeliveryOutbox.user_id==u.id).order_by(DeliveryOutbox.created_at.desc()).limit(100)).all();emails=db.scalars(select(AuthIdentity.email).where(AuthIdentity.user_id==u.id,AuthIdentity.email.is_not(None))).all();subscriptions=db.scalars(select(PushSubscription).where(PushSubscription.user_id==u.id,PushSubscription.enabled==True)).all();categories=set(json.loads(pref.event_categories));return templates.TemplateResponse(request,'notification_settings.html',ctx(request,u,pref=pref,categories=categories,deliveries=deliveries,has_email=bool(emails),smtp_configured=bool(s.smtp_host and s.smtp_from),push_configured=bool(s.vapid_public_key and s.vapid_private_key),push_subscriptions=subscriptions))
 @app.post('/account/notifications')
-def update_notification_settings(request:Request,web_enabled:bool=Form(False),email_enabled:bool=Form(False),telegram_enabled:bool=Form(False),categories:list[str]=Form([]),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
+def update_notification_settings(request:Request,web_enabled:bool=Form(False),email_enabled:bool=Form(False),telegram_enabled:bool=Form(False),push_enabled:bool=Form(False),categories:list[str]=Form([]),u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     allowed={'deployment','security','billing','support','incident'};selected=sorted(set(categories)&allowed);pref=db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==u.id))
     if not pref:pref=NotificationPreference(user_id=u.id);db.add(pref)
-    pref.web_enabled=web_enabled;pref.email_enabled=email_enabled;pref.telegram_enabled=telegram_enabled;pref.event_categories=json.dumps(selected);audit(db,u,'notifications.preferences','account',request.client.host if request.client else '',{'web':web_enabled,'email':email_enabled,'telegram':telegram_enabled,'categories':selected});db.commit();return RedirectResponse('/account/notifications',303)
+    pref.web_enabled=web_enabled;pref.email_enabled=email_enabled;pref.telegram_enabled=telegram_enabled;pref.push_enabled=push_enabled;pref.event_categories=json.dumps(selected);audit(db,u,'notifications.preferences','account',request.client.host if request.client else '',{'web':web_enabled,'email':email_enabled,'telegram':telegram_enabled,'push':push_enabled,'categories':selected});db.commit();return RedirectResponse('/account/notifications',303)
 @app.post('/account/notifications/test')
 def test_notification(request:Request,u:User=Depends(current),_=Depends(csrf),db:Session=Depends(get_db)):
     emit(db,u.id,'security.test','Test notification','Your BlazeNXT notification automation is configured correctly.');db.commit();return RedirectResponse('/account/notifications',303)

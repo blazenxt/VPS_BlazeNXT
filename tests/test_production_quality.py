@@ -7,9 +7,9 @@ from app.migrations import run_migrations
 def test_migration_bootstrap_is_idempotent():
     first=run_migrations();second=run_migrations()
     assert first['state']=='ready' and second['state']=='ready'
-    assert first['revision']=='0001_blazenxt_v1'
+    assert first['revision']=='0002_web_push'
     assert 'alembic_version' in inspect(engine).get_table_names()
-    with engine.connect() as connection:assert connection.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0001_blazenxt_v1'
+    with engine.connect() as connection:assert connection.execute(text('SELECT version_num FROM alembic_version')).scalar()=='0002_web_push'
 def test_request_id_and_error_formats():
     with TestClient(app) as client:
         html=client.get('/this-page-does-not-exist',headers={'X-Request-ID':'quality-test-id'})
@@ -19,7 +19,7 @@ def test_request_id_and_error_formats():
 def test_readiness_reports_migration_revision():
     with TestClient(app) as client:
         data=client.get('/health/ready').json()
-        assert data['migration_state']=='ready' and data['database_revision']=='0001_blazenxt_v1'
+        assert data['migration_state']=='ready' and data['database_revision']=='0002_web_push'
 def test_large_static_asset_can_be_compressed():
     with TestClient(app) as client:
         response=client.get('/static/blazenxt.css',headers={'Accept-Encoding':'gzip'})

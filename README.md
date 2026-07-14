@@ -355,6 +355,24 @@ SMTP is used for:
 - Billing/plan events
 - Incident announcements
 
+### Browser Web Push (VAPID)
+
+Generate a VAPID key pair locally:
+
+```bash
+npx web-push generate-vapid-keys
+```
+
+Add the generated values to Railway:
+
+```env
+VAPID_PUBLIC_KEY=YOUR_URL_SAFE_PUBLIC_KEY
+VAPID_PRIVATE_KEY=YOUR_PRIVATE_KEY
+VAPID_SUBJECT=mailto:admin@YOUR-DOMAIN
+```
+
+Users can enable Push per device under `/account/notifications`. Expired browser subscriptions are automatically disabled after push providers return `404` or `410`.
+
 User preferences:
 
 ```text
@@ -571,13 +589,19 @@ deployment trigger
 
 ## Database migrations and production diagnostics
 
-BlazeNXT v1.0.0 uses Alembic. On the first deployment of an existing pre-Alembic installation, startup creates any missing current tables and stamps revision:
+BlazeNXT v1.0.0 uses Alembic. The schema baseline is:
 
 ```text
 0001_blazenxt_v1
 ```
 
-New databases run the baseline migration normally. PostgreSQL replicas coordinate startup with an advisory migration lock. Destructive baseline downgrade is disabled.
+The current v1.0.0 schema revision is:
+
+```text
+0002_web_push
+```
+
+On the first deployment of an existing pre-Alembic installation, startup creates missing current tables and stamps the current migration head without dropping data. New databases run the baseline and subsequent migrations normally. PostgreSQL replicas coordinate startup with an advisory migration lock. Destructive baseline downgrade is disabled.
 
 Useful diagnostics:
 

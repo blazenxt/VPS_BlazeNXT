@@ -2,17 +2,19 @@ import asyncio,html,json,smtplib
 from datetime import datetime,timedelta,timezone
 from email.message import EmailMessage
 from sqlalchemy import select
+from pywebpush import WebPushException,webpush
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import AuthIdentity,DeliveryOutbox,Notification,NotificationPreference,User
+from app.models import AuthIdentity,DeliveryOutbox,Notification,NotificationPreference,PushSubscription,User
 s=get_settings();CATEGORIES={'deployment','security','billing','support','incident'}
 def preference_for(db,user_id):return db.scalar(select(NotificationPreference).where(NotificationPreference.user_id==user_id))
 def emit(db,user_id,event,title,message,telegram=True):
     category=event.split('.',1)[0];pref=preference_for(db,user_id);categories=set(json.loads(pref.event_categories)) if pref else CATEGORIES
     if category not in categories and category!='security':return
-    web_enabled=not pref or pref.web_enabled or category=='security';email_enabled=(not pref or pref.email_enabled) and bool(s.smtp_host and s.smtp_from);telegram_enabled=not pref or pref.telegram_enabled
+    web_enabled=not pref or pref.web_enabled or category=='security';email_enabled=(not pref or pref.email_enabled) and bool(s.smtp_host and s.smtp_from);telegram_enabled=not pref or pref.telegram_enabled;push_enabled=(not pref or pref.push_enabled) and bool(s.vapid_public_key and s.vapid_private_key)
     if web_enabled:db.add(Notification(user_id=user_id,title=title[:120],message=message[:5000]))
     if email_enabled:db.add(DeliveryOutbox(user_id=user_id,channel='email',event=event,title=title[:160],message=message[:5000]))
+    if push_enabled and db.scalar(select(PushSubscription.id).where(PushSubscription.user_id==user_id,PushSubscription.enabled==True).limit(1)):db.add(DeliveryOutbox(user_id=user_id,channel='push',event=event,title=title[:160],message=message[:5000]))
     user=db.get(User,user_id)
     if telegram and telegram_enabled and user and user.telegram_id>0:db.add(DeliveryOutbox(user_id=user_id,channel='telegram',event=event,title=title[:160],message=message[:5000]))
 def primary_email(db,user_id):
@@ -26,6 +28,9 @@ def send_email(to,title,message,event):
         if s.smtp_starttls:server.starttls()
         if s.smtp_username:server.login(s.smtp_username,s.smtp_password)
         server.send_message(mail)
+def send_push(subscription,title,message,event):
+    payload=json.dumps({'title':title,'body':message[:500],'event':event,'url':s.web_base_url+'/notifications','icon':'/static/pwa-192.png','badge':'/static/blazenxt-favicon.png'},separators=(',',':'))
+    return webpush(subscription_info={'endpoint':subscription.endpoint,'keys':{'p256dh':subscription.p256dh,'auth':subscription.auth}},data=payload,vapid_private_key=s.vapid_private_key,vapid_claims={'sub':s.vapid_subject})
 async def process_outbox(limit=30):
     with SessionLocal() as db:
         now=datetime.now(timezone.utc);rows=db.scalars(select(DeliveryOutbox).where(DeliveryOutbox.status=='pending',DeliveryOutbox.next_attempt<=now,DeliveryOutbox.attempts<5).order_by(DeliveryOutbox.created_at).limit(limit)).all()
@@ -38,6 +43,15 @@ async def process_outbox(limit=30):
                 elif row.channel=='telegram':
                     from app.telegram_bot import send_user_notification
                     await send_user_notification(row.user_id,f'🔔 <b>{html.escape(row.title)}</b>\n{html.escape(row.message)}')
+                elif row.channel=='push':
+                    subscriptions=db.scalars(select(PushSubscription).where(PushSubscription.user_id==row.user_id,PushSubscription.enabled==True)).all();delivered=0;errors=[]
+                    for subscription in subscriptions:
+                        try:await asyncio.to_thread(send_push,subscription,row.title,row.message,row.event);subscription.last_success_at=now;subscription.last_error=None;delivered+=1
+                        except WebPushException as exc:
+                            status=getattr(getattr(exc,'response',None),'status_code',None);subscription.last_error=str(exc)[:500]
+                            if status in {404,410}:subscription.enabled=False
+                            else:errors.append(str(exc))
+                    if not delivered:raise RuntimeError(errors[0] if errors else 'No active push subscription')
                 else:raise RuntimeError('Unsupported delivery channel')
                 row.status='sent';row.sent_at=now;row.last_error=None
             except Exception as e:

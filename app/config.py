@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     s3_prefix: str = 'blazenxt'
     s3_force_path_style: bool = True
     offsite_backup_max_mb: int = Field(50, ge=1, le=512)
+    vapid_public_key: str = ''
+    vapid_private_key: str = ''
+    vapid_subject: str = 'mailto:admin@example.com'
     owner_ids: str = ''
     max_upload_mb: int = Field(10, ge=1, le=50)
     global_workload_limit: int = Field(0, ge=0, le=10000)
