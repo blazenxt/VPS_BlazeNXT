@@ -5,6 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+COPY migrations ./migrations
+COPY alembic.ini ./alembic.ini
 COPY templates ./templates
 COPY static ./static
 RUN chown -R app:app /app
